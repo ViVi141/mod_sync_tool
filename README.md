@@ -92,9 +92,7 @@
 {
     "mod_id": {
         "name": "模组名称",
-        "version": "版本号",
-        "filename": "模组文件名.7z",
-        "path": "存储路径"
+        "version": "版本号"
     }
 }
 ```
@@ -109,13 +107,23 @@
         "retry_delay": 1,
         "max_workers": 4
     },
-    "weifang": {
+    "MinIO节点一": {
         "endpoint": "你的节点地址",
         "port": 9000,
         "access_key": "访问密钥",
         "secret_key": "密钥",
-        "secure": false
+        "secure": false,
+        "region": "auto"
+    }，
+    "MinIO节点二: {
+        "endpoint": "你的节点地址",
+        "port": 9000,
+        "access_key": "访问密钥",
+        "secret_key": "密钥",
+        "secure": false,
+        "region": "auto"
     }
+
 }
 ```
 
