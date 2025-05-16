@@ -74,7 +74,7 @@
 
 ### 2. 配置文件结构
 #### 2.1 配置服务器文件
-在 `https://www.vivi141.com/upload` 下需要准备以下文件：
+在 `https://example/upload` 下需要准备以下文件：
 
 1. `mod_lists.json` - 模组列表配置
 ```json
