@@ -7,13 +7,16 @@ import queue
 import concurrent.futures
 from typing import Dict, List, Tuple, Optional, Callable
 import logging
-from minio import Minio
-from minio.error import S3Error
 import py7zr
 import requests
 from urllib.parse import urljoin
-import pkg_resources
 import semver
+import hashlib
+import uuid
+from botocore.client import Config
+from botocore.exceptions import ClientError
+import boto3
+import random
 
 class SensitiveFilter(logging.Filter):
     """日志过滤器，用于过滤敏感信息"""
@@ -38,20 +41,22 @@ class SensitiveFilter(logging.Filter):
                 record.msg = pattern.sub(r'\1=[REDACTED]', record.msg)
         return True
 
-# 配置日志过滤器
+# 配置日志过滤器：同时作用于专用 logger 与根 logger，避免敏感信息外泄
 logger = logging.getLogger("ModSyncTool")
 logger.addFilter(SensitiveFilter())
+logging.getLogger().addFilter(SensitiveFilter())
 
 class ModUtils:
     # 版本信息
-    VERSION = "2.1.2"  # 当前版本
-    MIN_VERSION = "2.1.2"  # 最低支持版本
-    VERSION_CHECK_URL = "https://example/version.json"  # 版本检查URL
+    VERSION = "3.0.0"  # 当前版本
+    MIN_VERSION = "3.0.0"  # 最低支持版本
+    VERSION_CHECK_URL = "https://www.vivi141.com/version.json"  # 版本检查URL
+    VERSION_CACHE_FILE = ".version_cache.json"
     
     logger = logger
     # 配置服务器
     CONFIG_SERVER = {
-        'base_url': 'https://example/upload',
+        'base_url': 'https://www.vivi141.com/upload',
         'endpoints': {
             'mod_lists': '/mod_lists.json',
             'minio_config': '/minio_config.json',
@@ -63,9 +68,61 @@ class ModUtils:
         'cache_time': 300  # 5分钟缓存
     }
 
+    # 统一 User-Agent
+    USER_AGENT = f"ModSyncTool/{VERSION}"
+
+    @staticmethod
+    def build_headers(accept: Optional[str] = 'application/json', extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        """构造统一 UA 的请求头
+        Args:
+            accept: Accept 头，默认 application/json；传 None 则不设置
+            extra: 额外覆盖/追加的头
+        Returns:
+            dict: 请求头
+        """
+        headers = {
+            'User-Agent': ModUtils.USER_AGENT,
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'X-No-CDN': '1'
+        }
+        if accept:
+            headers['Accept'] = accept
+        if extra:
+            headers.update(extra)
+        return headers
+
     # 配置缓存
     _config_cache = {}
     _config_cache_time = {}
+    # R2 索引与解析缓存
+    # 统一缓存：解析后的键与一次性列举缓存
+    _r2_index_cache: Dict[Tuple[str, str], List[Tuple[str, int]]] = {}
+    _resolved_keys: Dict[str, str] = {}
+    _r2_index_data: Optional[dict] = None
+    _r2_index_time: float = 0.0
+    _index_lock = threading.Lock()
+    OBJECTS_LIST_CACHE_FILE = ".r2_objects_cache.json"
+    OBJECTS_LIST_CACHE_TTL_SEC = 300
+
+    @staticmethod
+    def build_target_mod_path(base_dir: str, mod_name: str, mod_id: str) -> str:
+        """生成目标模组目录：若 name 已包含 _{mod_id} 后缀则不再重复追加。
+        Args:
+            base_dir: 根目录
+            mod_name: 模组名称（可能已包含 _modid）
+            mod_id: 模组ID
+        Returns:
+            目标目录完整路径
+        """
+        try:
+            if isinstance(mod_name, str) and mod_name.lower().endswith(f"_{mod_id.lower()}"):
+                final_name = mod_name
+            else:
+                final_name = f"{mod_name}_{mod_id}"
+        except Exception:
+            final_name = f"{mod_name}_{mod_id}"
+        return os.path.join(base_dir, final_name)
 
     # 下载队列
     download_queue = queue.Queue()
@@ -85,17 +142,37 @@ class ModUtils:
     @classmethod
     def initialize(cls):
         """初始化类，检查版本并输出到日志"""
+        # 按用户要求，禁用任何版本网络请求，仅输出当前版本
+        cls.logger.info(f"当前版本: {cls.VERSION}")
+
+    @staticmethod
+    def categorize_error_message(err: Exception) -> str:
+        """将异常归类为更友好的错误信息"""
         try:
-            needs_update, current_version, latest_version, message = cls.get_version_info()
-            if needs_update:
-                cls.logger.info(f"当前版本: {current_version}")
-                cls.logger.info(f"发现新版本: {latest_version}")
-                cls.logger.info(f"更新说明: {message}")
-            else:
-                cls.logger.info(f"当前版本: {current_version}")
-                cls.logger.info(f"版本状态: {message}")
-        except Exception as e:
-            cls.logger.error("版本检查失败")
+            if isinstance(err, requests.Timeout):
+                return "网络超时"
+            if isinstance(err, requests.ConnectionError):
+                return "网络连接错误"
+            if isinstance(err, ClientError):
+                code = int(err.response.get('ResponseMetadata', {}).get('HTTPStatusCode', 0))
+                if code == 404:
+                    return "对象不存在"
+                if code == 403:
+                    return "访问被拒绝"
+                if code == 429:
+                    return "请求过多（限流）"
+                if code >= 500:
+                    return f"服务端错误({code})"
+            msg = str(err).lower()
+            if 'no space' in msg or 'not enough space' in msg or 'disk' in msg:
+                return "磁盘空间不足"
+            if 'permission' in msg or 'denied' in msg:
+                return "权限不足"
+            if 'checksum' in msg or 'integrity' in msg or '验证失败' in msg:
+                return "文件校验失败"
+        except Exception:
+            pass
+        return str(err)
 
     @staticmethod
     def check_version() -> Tuple[bool, str, str, str]:
@@ -103,60 +180,8 @@ class ModUtils:
         Returns:
             Tuple[bool, str, str, str]: (是否需要更新, 当前版本, 最新版本, 更新说明)
         """
-        try:
-            # 添加时间戳和no-cdn参数避免 CDN 缓存
-            timestamp = int(time.time())
-            url = f"{ModUtils.VERSION_CHECK_URL}?t={timestamp}&no-cdn=1"
-            
-            headers = {
-                'User-Agent': f'ModSyncTool/{ModUtils.VERSION}',
-                'Accept': 'application/json',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache',
-                'X-No-CDN': '1'
-            }
-            
-            response = requests.get(
-                url,
-                timeout=ModUtils.CONFIG_SERVER['timeout'],
-                headers=headers
-            )
-            response.raise_for_status()
-            
-            version_info = response.json()
-            
-            # 验证版本信息格式
-            if not isinstance(version_info, dict):
-                raise ValueError("版本信息格式错误")
-                
-            required_fields = ['version', 'min_version', 'download_url', 'changelog']
-            missing_fields = [field for field in required_fields if field not in version_info]
-            if missing_fields:
-                raise ValueError(f"版本信息缺少必要字段: {', '.join(missing_fields)}")
-            
-            current_version = ModUtils.VERSION
-            latest_version = version_info['version']
-            min_version = version_info['min_version']
-            
-            # 检查最低版本要求
-            if semver.compare(current_version, min_version) < 0:
-                return True, current_version, latest_version, "当前版本过低，需要更新"
-            
-            # 检查是否有新版本
-            if semver.compare(current_version, latest_version) < 0:
-                return True, current_version, latest_version, "发现新版本"
-            
-            return False, current_version, latest_version, "当前已是最新版本"
-            
-        except requests.RequestException as e:
-            logging.error("检查版本更新失败: 网络请求错误")
-            return False, ModUtils.VERSION, ModUtils.VERSION, "检查更新失败"
-        except ValueError as e:
-            logging.error(f"检查版本更新失败: {str(e)}")
-            return False, ModUtils.VERSION, ModUtils.VERSION, "版本信息格式错误"
-        except Exception as e:
-            logging.error("检查版本更新失败: 未知错误")
-            return False, ModUtils.VERSION, ModUtils.VERSION, "检查更新失败"
+        # 按用户要求，彻底禁用版本检查
+        return False, ModUtils.VERSION, ModUtils.VERSION, "版本检查已禁用"
 
     @staticmethod
     def get_version_info() -> Tuple[bool, str, str, str]:
@@ -164,34 +189,8 @@ class ModUtils:
         Returns:
             Tuple[bool, str, str, str]: (是否需要更新, 当前版本, 最新版本, 消息)
         """
-        try:
-            # 获取版本信息
-            response = requests.get(
-                ModUtils.VERSION_CHECK_URL,
-                timeout=ModUtils.CONFIG_SERVER['timeout']
-            )
-            response.raise_for_status()
-            version_info = response.json()
-            
-            current_version = ModUtils.VERSION
-            latest_version = version_info.get('version', current_version)
-            message = version_info.get('message', '')
-            
-            # 比较版本
-            if latest_version > current_version:
-                return True, current_version, latest_version, message
-                
-            return False, current_version, latest_version, "当前已是最新版本"
-            
-        except requests.RequestException as e:
-            logging.error("检查版本更新失败: 网络请求错误")
-            return False, ModUtils.VERSION, ModUtils.VERSION, "检查更新失败"
-        except ValueError as e:
-            logging.error(f"检查版本更新失败: {str(e)}")
-            return False, ModUtils.VERSION, ModUtils.VERSION, "版本信息格式错误"
-        except Exception as e:
-            logging.error("检查版本更新失败: 未知错误")
-            return False, ModUtils.VERSION, ModUtils.VERSION, "检查更新失败"
+        # 按用户要求，彻底禁用版本检查
+        return False, ModUtils.VERSION, ModUtils.VERSION, "版本检查已禁用"
 
     @staticmethod
     def fetch_config(endpoint):
@@ -200,13 +199,7 @@ class ModUtils:
             # 添加时间戳和no-cdn参数避免 CDN 缓存
             timestamp = int(time.time())
             url = f"{ModUtils.CONFIG_SERVER['base_url']}/{endpoint.lstrip('/')}?t={timestamp}&no-cdn=1"
-            headers = {
-                'User-Agent': 'ModSyncTool/2.0',
-                'Accept': 'application/json',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache',
-                'X-No-CDN': '1'  # 添加自定义头，请求不使用CDN
-            }
+            headers = ModUtils.build_headers('application/json')
             response = requests.get(
                 url,
                 timeout=ModUtils.CONFIG_SERVER['timeout'],
@@ -283,21 +276,38 @@ class ModUtils:
                 except Exception as e:
                     return False, f"创建目录失败: {str(e)}"
             
-            # 检查读写权限
-            test_file = os.path.join(path, "test_permission.tmp")
+            # 检查读写权限（使用唯一临时文件，避免并发冲突）
+            test_file = os.path.join(path, f".perm_test_{uuid.uuid4().hex}.tmp")
             try:
-                # 测试写入权限
-                with open(test_file, 'w') as f:
-                    f.write("test")
+                # 测试写入权限（独占创建）
+                with open(test_file, 'xb') as f:
+                    f.write(b"test")
                 # 测试读取权限
-                with open(test_file, 'r') as f:
-                    f.read()
+                with open(test_file, 'rb') as f:
+                    _ = f.read()
                 # 测试删除权限
                 os.remove(test_file)
                 return True, ""
+            except FileExistsError:
+                # 罕见冲突时重试一次
+                try:
+                    os.remove(test_file)
+                except Exception:
+                    pass
+                return ModUtils.check_path_permissions(path)
             except PermissionError:
+                try:
+                    if os.path.exists(test_file):
+                        os.remove(test_file)
+                except Exception:
+                    pass
                 return False, "没有足够的文件访问权限"
             except Exception as e:
+                try:
+                    if os.path.exists(test_file):
+                        os.remove(test_file)
+                except Exception:
+                    pass
                 return False, f"权限检查失败: {str(e)}"
         except Exception as e:
             return False, f"路径检查失败: {str(e)}"
@@ -357,13 +367,7 @@ class ModUtils:
             timestamp = int(time.time())
             url = f"{url}?t={timestamp}&no-cdn=1"
             
-            headers = {
-                'User-Agent': 'ModSyncTool/2.0',
-                'Accept': 'application/json',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache',
-                'X-No-CDN': '1'  # 添加自定义头，请求不使用CDN
-            }
+            headers = ModUtils.build_headers('application/json')
             response = requests.get(url, timeout=ModUtils.CONFIG_SERVER['timeout'], headers=headers)
             response.raise_for_status()
             
@@ -433,8 +437,23 @@ class ModUtils:
             if not config:
                 return []
             
-            # 返回所有配置的节点（排除 settings）
-            return [node_id for node_id in config.keys() if node_id != 'settings']
+            # 是否强制仅使用 R2 S3 节点
+            settings = config.get('settings', {}) if isinstance(config, dict) else {}
+            force_r2_only = bool(settings.get('force_r2_only', False))
+
+            node_ids = []
+            for node_id, node_info in config.items():
+                if node_id == 'settings':
+                    continue
+                if force_r2_only:
+                    try:
+                        endpoint = str(node_info.get('endpoint', ''))
+                        if 'r2.cloudflarestorage.com' not in endpoint:
+                            continue
+                    except Exception:
+                        continue
+                node_ids.append(node_id)
+            return node_ids
         except Exception as e:
             logging.error(f"获取可用节点失败: {str(e)}")
             return []
@@ -463,8 +482,8 @@ class ModUtils:
             return None
 
     @staticmethod
-    def get_minio_client(node_id: str = None) -> Minio:
-        """获取 MinIO 客户端"""
+    def get_minio_client(node_id: str = None) -> boto3.client:
+        """获取 Cloudflare R2 客户端（使用 boto3 兼容 S3）"""
         try:
             # 如果没有指定节点，使用最佳节点
             if not node_id:
@@ -477,23 +496,40 @@ class ModUtils:
             if not node_info:
                 raise Exception(f"无法获取节点 {node_id} 的配置")
             
-            # 获取全局设置
-            config = ModUtils.get_minio_config_from_web()
-            if not config or 'settings' not in config:
-                raise Exception("无法获取 MinIO 全局设置")
-            
-            # 创建 MinIO 客户端
-            client = Minio(
-                endpoint=f"{node_info['endpoint']}:{node_info['port']}",
-                access_key=node_info['access_key'],
-                secret_key=node_info['secret_key'],
-                secure=node_info.get('secure', False),
-                region=node_info.get('region', '')
+            # 规范化 endpoint
+            endpoint_host = str(node_info['endpoint'])
+            try:
+                if endpoint_host.startswith('http://') or endpoint_host.startswith('https://'):
+                    from urllib.parse import urlparse
+                    parsed = urlparse(endpoint_host)
+                    endpoint_host = parsed.netloc or parsed.path
+                if '/' in endpoint_host:
+                    endpoint_host = endpoint_host.split('/', 1)[0]
+            except Exception:
+                endpoint_host = endpoint_host.split('://', 1)[-1].split('/', 1)[0]
+
+            # 创建 boto3 S3 客户端，兼容 Cloudflare R2
+            settings = ModUtils.get_minio_settings() or {}
+            timeout_val = int(settings.get('timeout', ModUtils.CONFIG_SERVER.get('timeout', 10)))
+            max_conns = int(max(8, int(settings.get('max_workers', 4)) * 2))
+            client = boto3.client(
+                's3',
+                endpoint_url=f"https://{endpoint_host}:{node_info['port']}" if node_info.get('secure', False) else f"http://{endpoint_host}:{node_info['port']}",
+                aws_access_key_id=node_info['access_key'],
+                aws_secret_access_key=node_info['secret_key'],
+                region_name=node_info.get('region', 'auto'),
+                config=Config(
+                    signature_version='s3v4',
+                    connect_timeout=timeout_val,
+                    read_timeout=timeout_val,
+                    max_pool_connections=max_conns,
+                    retries={'max_attempts': 1, 'mode': 'standard'}
+                )
             )
             
             return client
         except Exception as e:
-            logging.error("创建 MinIO 客户端失败")
+            logging.error("创建 Cloudflare R2 客户端失败")
             raise
 
     @staticmethod
@@ -526,13 +562,7 @@ class ModUtils:
                 mod_info_url = urljoin(base_url + '/', list_config['file'])
                 timestamp = int(time.time())
                 mod_info_url = f"{mod_info_url}?t={timestamp}&no-cdn=1"
-                headers = {
-                    'User-Agent': 'ModSyncTool/2.0',
-                    'Accept': 'application/json',
-                    'Cache-Control': 'no-cache',
-                    'Pragma': 'no-cache',
-                    'X-No-CDN': '1'
-                }
+                headers = ModUtils.build_headers('application/json')
                 response = requests.get(mod_info_url, timeout=ModUtils.CONFIG_SERVER['timeout'], headers=headers)
                 response.raise_for_status()
                 mods = response.json()
@@ -544,41 +574,30 @@ class ModUtils:
                         info['path'] = info['filename']
                 return mods
             except Exception as e:
-                logging.warning(f"HTTP获取mod_info.json失败，尝试MinIO: {str(e)}")
+                logging.warning(f"HTTP获取mod_info.json失败，尝试R2直连获取: {str(e)}")
             
-            # 获取 MinIO 配置
+            # 获取 R2 配置
             minio_config = ModUtils.get_minio_config_from_web()
             if not minio_config:
-                raise Exception("无法获取 MinIO 配置")
+                raise Exception("无法获取 R2 配置")
                 
             # 获取全局设置
             settings = minio_config.get('settings')
             if not settings:
-                raise Exception("无法获取 MinIO 全局设置")
+                raise Exception("无法获取 R2 全局设置")
                 
             bucket = settings.get('bucket')
             if not bucket:
-                raise Exception("MinIO 配置中缺少 bucket 设置")
+                raise Exception("R2 配置中缺少 bucket 设置")
             
             # 获取模组信息文件
             temp_file = 'mod_info.json'
             try:
-                # 尝试从潍坊节点获取
-                try:
-                    client = ModUtils.get_minio_client('weifang')
-                    client.fget_object(
-                        bucket,
-                        list_config['file'],
-                        temp_file
-                    )
-                except S3Error:
-                    # 如果潍坊节点失败，尝试上海节点
-                    client = ModUtils.get_minio_client('shanghai')
-                    client.fget_object(
-                        bucket,
-                        list_config['file'],
-                        temp_file
-                    )
+                # 通过 boto3 直接获取对象
+                client = ModUtils.get_minio_client()
+                obj = client.get_object(Bucket=bucket, Key=list_config['file'])
+                with open(temp_file, 'wb') as f:
+                    f.write(obj['Body'].read())
                 
                 # 读取模组信息
                 with open(temp_file, 'r', encoding='utf-8') as f:
@@ -666,24 +685,20 @@ class ModUtils:
                 if actual_size != expected_size:
                     return False, f"文件大小不匹配: 预期 {expected_size} 字节, 实际 {actual_size} 字节"
             
-            # 如果是7z文件，验证完整性
+            # 如果是7z文件，做轻量校验（避免对大文件进行二次全面解压测试导致卡住）
             if is_7z:
                 try:
-                    # 先尝试打开文件
+                    # 检查7z头
                     with open(file_path, 'rb') as f:
-                        # 检查文件头部标识
                         header = f.read(6)
                         if header != b'7z\xbc\xaf\x27\x1c':
                             return False, "不是有效的7z文件格式"
-                            
-                    # 尝试解压测试
-                    with py7zr.SevenZipFile(file_path, mode='r') as z:
-                        try:
-                            if not z.test():
-                                return False, "7z文件完整性验证失败"
-                        except Exception as e:
-                            return False, f"7z文件测试失败: {str(e)}"
-                    
+                    # 仅解析头部与目录，不做全量 test
+                    try:
+                        with py7zr.SevenZipFile(file_path, mode='r') as z:
+                            _ = z.getnames()  # 触发元数据解析
+                    except Exception as e:
+                        return False, f"7z元数据解析失败: {str(e)}"
                 except Exception as e:
                     return False, f"7z文件验证失败: {str(e)}"
                     
@@ -729,90 +744,87 @@ class ModUtils:
         return "无效的操作类型"
 
     @staticmethod
-    def check_node_latency(endpoint: str, port: int) -> tuple:
-        """检查节点延迟
+    def check_node_latency(endpoint: str, port: int, samples: int = 3, method: str = 'tcp', secure: bool = False, verify_ssl: Optional[bool] = None) -> tuple:
+        """检查节点延迟（更稳健，多次采样取中位数）
         Args:
             endpoint: 节点地址
             port: 节点端口
+            samples: 采样次数，默认3次
+            method: 'tcp' 仅TCP连接耗时；'http' 访问健康检查接口
         Returns:
             tuple: (延迟时间(毫秒), 是否可用)
         """
         try:
             if not endpoint or not port:
                 return float('inf'), False
-                
-            # 构建健康检查URL
-            url = f"http://{endpoint}:{port}/minio/health/live"
-            
-            # 设置请求头
-            headers = {
-                'User-Agent': 'ModSyncTool/2.0',
-                'Accept': 'application/json',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache',
-                'X-No-CDN': '1'  # 添加自定义头，请求不使用CDN
-            }
-            
-            # 发送请求并计算延迟
-            start_time = time.time()
-            response = requests.get(
-                url,
-                timeout=2,  # 2秒超时
-                headers=headers
-            )
-            end_time = time.time()
-            
-            # 计算延迟（毫秒）
-            latency = (end_time - start_time) * 1000
-            
-            # 检查响应状态
-            is_available = response.status_code == 200
-            
-            if is_available:
-                logging.debug(f"节点 {endpoint}:{port} 延迟: {latency:.2f}ms")
+
+            import socket
+            # 规范化 endpoint，去掉 http/https 前缀，避免 TCP 直连失败
+            try:
+                if isinstance(endpoint, str) and (endpoint.startswith('http://') or endpoint.startswith('https://')):
+                    from urllib.parse import urlparse
+                    parsed = urlparse(endpoint)
+                    endpoint = parsed.netloc or parsed.path
+            except Exception:
+                endpoint = endpoint.split('://', 1)[-1]
+            import statistics
+
+            latencies_ms = []
+
+            if method == 'tcp':
+                for _ in range(max(1, samples)):
+                    try:
+                        start = time.perf_counter()
+                        with socket.create_connection((endpoint, int(port)), timeout=1.5):
+                            pass
+                        end = time.perf_counter()
+                        latencies_ms.append((end - start) * 1000.0)
+                    except (socket.timeout, OSError):
+                        continue
             else:
-                logging.debug(f"节点 {endpoint}:{port} 不可用，状态码: {response.status_code}")
-                
-            return latency, is_available
-            
-        except requests.exceptions.Timeout:
-            logging.debug(f"节点 {endpoint}:{port} 连接超时")
-            return float('inf'), False
-        except requests.exceptions.ConnectionError:
-            logging.debug(f"节点 {endpoint}:{port} 连接失败")
-            return float('inf'), False
+                # HTTP 健康检查作为备选
+                scheme = 'https' if secure else 'http'
+                url = f"{scheme}://{endpoint}:{port}/minio/health/live"
+                headers = ModUtils.build_headers('application/json', {'Connection': 'close'})
+                for _ in range(max(1, samples)):
+                    try:
+                        start = time.perf_counter()
+                        # 默认开启证书校验；允许调用方显式关闭
+                        if verify_ssl is None:
+                            verify = True
+                        else:
+                            verify = bool(verify_ssl)
+                        resp = requests.get(url, timeout=1.5, headers=headers, verify=verify)
+                        end = time.perf_counter()
+                        if resp.status_code == 200:
+                            latencies_ms.append((end - start) * 1000.0)
+                    except requests.RequestException:
+                        continue
+
+            if not latencies_ms:
+                # TCP失败时尝试一次HTTP作为最终回退
+                if method == 'tcp':
+                    return ModUtils.check_node_latency(endpoint, port, samples=samples, method='http')
+                return float('inf'), False
+
+            median_latency = statistics.median(latencies_ms)
+            return median_latency, True
         except Exception as e:
             logging.debug(f"检查节点 {endpoint}:{port} 延迟失败: {str(e)}")
             return float('inf'), False
 
     @staticmethod
     def get_node_bandwidth(node_id: str) -> Tuple[float, float]:
-        """获取节点带宽
-        Args:
-            node_id: 节点ID
-        Returns:
-            Tuple[float, float]: (下载带宽 Mbps, 上传带宽 Mbps)
+        """获取节点带宽（占位实现）
+        MinIO Python SDK 无通用 get_bucket_stats 接口，此处返回 0 以避免误用引发异常。
         """
         try:
+            # 若未来接入自定义探测，可在此实现（例如下载小对象测算速率）
             node_info = ModUtils.get_node_info(node_id)
             if not node_info:
                 return 0.0, 0.0
-                
-            client = ModUtils.get_minio_client(node_id)
-            stats = client.get_bucket_stats()
-            
-            # 获取带宽信息
-            download_rate = stats.get('download_rate', 0)  # bytes/s
-            upload_rate = stats.get('upload_rate', 0)      # bytes/s
-            
-            # 转换为 Mbps
-            download_mbps = (download_rate * 8) / (1024 * 1024)
-            upload_mbps = (upload_rate * 8) / (1024 * 1024)
-            
-            return download_mbps, upload_mbps
-            
-        except Exception as e:
-            ModUtils.logger.error(f"获取节点 {node_id} 带宽失败: {str(e)}")
+            return 0.0, 0.0
+        except Exception:
             return 0.0, 0.0
 
     @staticmethod
@@ -897,7 +909,10 @@ class ModUtils:
             available_nodes = ModUtils.get_available_nodes()
             if not available_nodes:
                 return None
-                
+            # 若存在 r2s3，优先返回（配合仅 R2 的场景）
+            if 'r2s3' in available_nodes:
+                return 'r2s3'
+
             best_node = None
             best_load = float('inf')
             
@@ -982,8 +997,18 @@ class ModUtils:
                     time.sleep(sleep_time)
 
     @staticmethod
-    def download_mod(mod_id: str, target_path: str, max_retries: int = 3, progress_callback=None, preferred_node: str = None, mod_list=None) -> bool:
-        """从Minio下载单个模组，支持负载均衡和断点续传"""
+    def download_mod(
+        mod_id: str,
+        target_path: str,
+        max_retries: int = 3,
+        progress_callback=None,
+        preferred_node: str = None,
+        mod_list=None,
+        resolved_path: Optional[str] = None,
+        expected_size_override: Optional[int] = None,
+        pause_event: Optional[threading.Event] = None,
+    ) -> bool:
+        """从 Cloudflare R2 下载单个模组，支持负载均衡和断点续传"""
         # 检查目标路径权限
         has_permission, error_msg = ModUtils.check_path_permissions(target_path)
         if not has_permission:
@@ -995,7 +1020,12 @@ class ModUtils:
             
         mod_name = remote_mods[mod_id]['name']
         remote_filename = remote_mods[mod_id].get('filename', f"{mod_name}_{mod_id}.7z")
-        remote_path = remote_mods[mod_id]['path']
+        remote_path = remote_mods[mod_id].get('path') or remote_filename
+        # 若调用方提供已解析路径或缓存中已有，优先使用
+        if resolved_path:
+            remote_path = resolved_path
+        elif mod_id in ModUtils._resolved_keys:
+            remote_path = ModUtils._resolved_keys[mod_id]
         
         # 确保目标路径存在
         os.makedirs(target_path, exist_ok=True)
@@ -1007,6 +1037,33 @@ class ModUtils:
         ModUtils.logger.info(f"临时文件路径: {temp_file}")
         ModUtils.logger.info(f"最终文件路径: {final_file}")
         
+        # 默认重试等待基值，后续使用指数退避+抖动
+        default_retry_delay = ModUtils.CONFIG_SERVER.get('retry_delay', 1)
+        base_delay = default_retry_delay
+        max_delay = 15
+
+        def _is_retryable_error(err: Exception) -> bool:
+            # requests 异常
+            if isinstance(err, requests.RequestException):
+                # 超时、连接错误可重试
+                return True
+            # boto3 ClientError: 5xx/429 可重试
+            if isinstance(err, ClientError):
+                try:
+                    code = int(err.response.get('ResponseMetadata', {}).get('HTTPStatusCode', 0))
+                    return code >= 500 or code == 429
+                except Exception:
+                    return False
+            # 常见的临时IO问题
+            transient = (BrokenPipeError, ConnectionError, TimeoutError)
+            return isinstance(err, transient)
+
+        def _backoff_sleep(attempt_idx: int):
+            # 指数退避 + 抖动
+            delay = min(max_delay, base_delay * (2 ** attempt_idx))
+            jitter = random.uniform(0, delay * 0.25)
+            time.sleep(delay + jitter)
+
         for attempt in range(max_retries):
             try:
                 # 获取最佳节点（考虑负载均衡）
@@ -1014,7 +1071,7 @@ class ModUtils:
                     # 检查首选节点是否可用
                     minio_config = ModUtils.get_minio_config_from_web()
                     if not minio_config:
-                        raise Exception("无法获取 MinIO 配置")
+                        raise Exception("无法获取 R2 配置")
 
                     if preferred_node in minio_config:
                         load = ModUtils.get_node_load(preferred_node)
@@ -1043,36 +1100,191 @@ class ModUtils:
                 
                 minio_config = ModUtils.get_minio_config_from_web()
                 if not minio_config:
-                    raise Exception("无法获取 MinIO 配置")
+                    raise Exception("无法获取 R2 配置")
 
                 settings = minio_config.get('settings')
                 if not settings:
-                    raise Exception("无法获取 MinIO 全局设置")
+                    raise Exception("无法获取 R2 全局设置")
                     
                 bucket = settings.get('bucket')
                 if not bucket:
-                    raise Exception("MinIO 配置中缺少 bucket 设置")
+                    raise Exception("R2 配置中缺少 bucket 设置")
 
-                stat = client.stat_object(bucket, remote_path)
-                file_size = stat.size
+                # 覆盖重试等待时间
+                try:
+                    current_retry_delay = int(settings.get('retry_delay', current_retry_delay))
+                except Exception:
+                    current_retry_delay = default_retry_delay
+
+                # 判断是否为 R2 HTTP 直连模式
+                http_mode = False
+                node_info = None
+                try:
+                    # 当 preferred_node 存在时优先用其信息，否则用自动选择的 node_name
+                    node_key = preferred_node if preferred_node else node_name
+                    node_info = ModUtils.get_node_info(node_key)
+                except Exception:
+                    node_info = None
+
+                if node_info and (node_info.get('type') == 'r2_http' or 'public_url_base' in node_info):
+                    http_mode = True
+
+                # 若为 R2（HTTP 模式或 R2 S3 端点），为对象键自动套前缀（仅限 R2）
+                is_r2_s3 = False
+                try:
+                    if not http_mode and node_info and isinstance(node_info.get('endpoint'), str):
+                        is_r2_s3 = 'r2.cloudflarestorage.com' in node_info['endpoint']
+                except Exception:
+                    is_r2_s3 = False
+
+                if http_mode or is_r2_s3:
+                    settings_for_prefix = ModUtils.get_minio_settings() or {}
+                    obj_prefix = str(settings_for_prefix.get('object_prefix', 'uploads/1/mods')).strip('/')
+                    norm_path = str(remote_path).lstrip('/').replace('\\', '/')
+                    if obj_prefix and not norm_path.startswith(obj_prefix + '/'):
+                        norm_path = f"{obj_prefix}/{norm_path}"
+                    remote_path = norm_path
+
+                # 统一：通过候选键探测真实对象键与大小（不做全量列举/索引）
+                def _resolve_key_and_size() -> Tuple[Optional[str], Optional[int], Optional[str]]:
+                    info = remote_mods.get(mod_id, {})
+                    filename = info.get('filename', remote_filename)
+                    name = info.get('name', '')
+                    version = info.get('version', '')
+                    object_prefix = str((settings or {}).get('object_prefix', 'uploads/1/mods')).strip('/')
+                    key_template = str((settings or {}).get('object_key_template', '')).strip()
+
+                    # 组装候选键
+                    candidates: List[str] = []
+                    # 1) 传入/缓存
+                    if resolved_path:
+                        candidates.append(str(resolved_path).lstrip('/'))
+                    elif mod_id in ModUtils._resolved_keys:
+                        candidates.append(str(ModUtils._resolved_keys[mod_id]).lstrip('/'))
+                    # 2) 显式 path
+                    raw_path = str(info.get('path') or '').strip()
+                    if raw_path:
+                        candidates.append(raw_path.lstrip('/'))
+                    # 3) 模板
+                    if key_template:
+                        try:
+                            rendered = key_template.format(
+                                object_prefix=object_prefix,
+                                mod_id=mod_id,
+                                filename=filename,
+                                name=name,
+                                version=version,
+                            ).strip('/').replace('\\', '/')
+                            if rendered:
+                                candidates.append(rendered)
+                        except Exception:
+                            pass
+                    # 4) 常规：prefix/filename 与 filename
+                    norm_filename = str(filename).lstrip('/').replace('\\', '/')
+                    if object_prefix:
+                        candidates.append(f"{object_prefix}/{norm_filename}")
+                    candidates.append(norm_filename)
+
+                    # 去重保持顺序
+                    seen = set()
+                    ordered_candidates = []
+                    for c in candidates:
+                        if not c:
+                            continue
+                        c = c.replace('\\', '/').lstrip('/')
+                        if c not in seen:
+                            seen.add(c)
+                            ordered_candidates.append(c)
+
+                    # 探测
+                    if http_mode and node_info:
+                        base = node_info.get('public_url_base')
+                        if not base:
+                            return None, None, None
+                        include_bucket = bool(node_info.get('bucket_in_path', True))
+                        http_timeout = max(2, int(settings.get('timeout', ModUtils.CONFIG_SERVER['timeout'])))
+                        headers = ModUtils.build_headers('*/*', {'Connection': 'close'})
+                        for key in ordered_candidates:
+                            try:
+                                if include_bucket:
+                                    test_url = f"{base.rstrip('/')}/{bucket}/{key}"
+                                else:
+                                    test_url = f"{base.rstrip('/')}/{key}"
+                                head_resp = requests.head(test_url, timeout=http_timeout, headers=headers, allow_redirects=True)
+                                if head_resp.status_code < 400 and head_resp.headers.get('Content-Length'):
+                                    size_val = int(head_resp.headers['Content-Length'])
+                                    return key, size_val, test_url
+                                # 某些环境禁 HEAD：降级到 GET range(0-0) 探测
+                                get_headers = dict(headers)
+                                get_headers['Range'] = 'bytes=0-0'
+                                get_resp = requests.get(test_url, timeout=http_timeout, headers=get_headers, stream=True, allow_redirects=True)
+                                if get_resp.status_code in (200, 206):
+                                    cr = get_resp.headers.get('Content-Range', '')
+                                    # Content-Range: bytes 0-0/12345
+                                    if '/' in cr:
+                                        total = cr.split('/')[-1]
+                                        if total.isdigit():
+                                            return key, int(total), test_url
+                            except Exception:
+                                continue
+                            finally:
+                                try:
+                                    head_resp.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    get_resp.close()
+                                except Exception:
+                                    pass
+                        return None, None, None
+                    else:
+                        if not client:
+                            return None, None, None
+                        for key in ordered_candidates:
+                            try:
+                                st = client.head_object(Bucket=bucket, Key=key)
+                                return key, int(st.get('ContentLength', 0) or 0), None
+                            except Exception:
+                                continue
+                        return None, None, None
+
+                # 解析真实键与大小
+                real_key = None
+                file_size = int(expected_size_override) if expected_size_override is not None else None
+                url = None
+                rk, sz, u = _resolve_key_and_size()
+                if rk:
+                    real_key = rk
+                    ModUtils._resolved_keys[mod_id] = real_key
+                if sz and not file_size:
+                    file_size = int(sz)
+                if u:
+                    url = u
+                # 若未解析出键，报错
+                if not real_key:
+                    raise Exception("无法定位远端对象键，请确保 mod_info.json 提供 'path' 或在 settings 中配置 'object_key_template'")
                 
                 # 检查本地临时文件，准备断点续传
                 local_size = 0
                 if os.path.exists(temp_file):
                     local_size = os.path.getsize(temp_file)
-                    if local_size > file_size:
+                    if file_size is not None and local_size > file_size:
                         os.remove(temp_file)
                         local_size = 0
                 
                 # 下载到临时文件
                 start_time = time.time()
                 
+                cancel_flag = {'cancelled': False}
+
                 class ProgressThread(threading.Thread):
                     def __init__(self):
                         super().__init__()
                         self.daemon = True
                         self._stop_event = threading.Event()
                         self._downloaded_size = local_size
+                        self._last_time = start_time
+                        self._last_size = local_size
                         
                     def stop(self):
                         self._stop_event.set()
@@ -1083,14 +1295,24 @@ class ModUtils:
                                 if os.path.exists(temp_file):
                                     current_size = os.path.getsize(temp_file)
                                     if current_size > self._downloaded_size:
-                                        elapsed = time.time() - start_time
-                                        speed = (current_size - local_size) / elapsed if elapsed > 0 else 0
+                                        now_ts = time.time()
+                                        delta_t = now_ts - self._last_time
+                                        delta_s = current_size - self._last_size
+                                        speed = (delta_s / delta_t) if delta_t > 0 else 0
                                         remain = file_size - current_size
                                         eta = remain / speed if speed > 0 else 0
                                         progress = (current_size / file_size) * 100
                                         if progress_callback:
-                                            progress_callback(progress, speed, eta)
+                                            try:
+                                                ret = progress_callback(mod_id, progress, speed, eta, current_size, file_size)
+                                                if ret is False:
+                                                    cancel_flag['cancelled'] = True
+                                                    break
+                                            except Exception as e:
+                                                ModUtils.logger.error(f"进度回调错误: {str(e)}")
                                         self._downloaded_size = current_size
+                                        self._last_time = now_ts
+                                        self._last_size = current_size
                             except Exception as e:
                                 ModUtils.logger.error(f"进度更新错误: {str(e)}")
                             time.sleep(0.5)
@@ -1099,25 +1321,99 @@ class ModUtils:
                 progress_thread.start()
                 
                 try:
-                    # 使用get_object替代fget_object
-                    response = client.get_object(
-                        bucket,
-                        remote_path
-                    )
-                    
-                    # 写入文件
-                    with open(temp_file, 'wb') as f:
-                        for chunk in response.stream(32*1024):  # 32KB chunks
-                            # 应用速度限制
-                            ModUtils._limit_speed(len(chunk))
-                            f.write(chunk)
-                            
+                    if not http_mode:
+                        # S3 续传：若存在本地部分，使用 Range 续传
+                        try:
+                            if local_size > 0 and file_size and local_size < file_size:
+                                response = client.get_object(Bucket=bucket, Key=real_key, Range=f'bytes={local_size}-')
+                                mode = 'ab'
+                            else:
+                                response = client.get_object(Bucket=bucket, Key=real_key)
+                                mode = 'wb'
+                            with open(temp_file, mode) as f:
+                                data = response['Body']
+                                for chunk in data.iter_chunks(chunk_size=1024*1024):  # 1MB chunks for better throughput
+                                    if pause_event is not None and not pause_event.is_set():
+                                        while pause_event is not None and not pause_event.is_set():
+                                            if cancel_flag['cancelled']:
+                                                raise Exception("同步被用户取消")
+                                            time.sleep(0.1)
+                                    if cancel_flag['cancelled']:
+                                        raise Exception("同步被用户取消")
+                                    if not chunk:
+                                        continue
+                                    ModUtils._limit_speed(len(chunk))
+                                    f.write(chunk)
+                        finally:
+                            if 'response' in locals():
+                                try:
+                                    data.close()
+                                except Exception:
+                                    pass
+                    else:
+                        # 使用 HTTP(S) 直连（支持 Range 断点续传）
+                        http_timeout = max(5, int(settings.get('timeout', ModUtils.CONFIG_SERVER['timeout'])))
+                        headers = ModUtils.build_headers('*/*', {'Connection': 'keep-alive'})
+                        # 如果本地已有部分内容，尝试使用 Range 续传
+                        mode = 'wb'
+                        if local_size > 0:
+                            headers['Range'] = f'bytes={local_size}-'
+                            mode = 'ab'
+                        if not url:
+                            # 兜底构造 URL（不包含 include_bucket 变化，仅用于已知 public_url_base 的场景）
+                            base = node_info.get('public_url_base')
+                            include_bucket = bool(node_info.get('bucket_in_path', True))
+                            if include_bucket:
+                                url = f"{base.rstrip('/')}/{bucket}/{real_key}"
+                            else:
+                                url = f"{base.rstrip('/')}/{real_key}"
+                        # 使用 Session 复用连接，并在任务结束后主动关闭，避免污染后续任务
+                        import requests as _rq
+                        from requests.adapters import HTTPAdapter
+                        _session = _rq.Session()
+                        try:
+                            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
+                            _session.mount('http://', adapter)
+                            _session.mount('https://', adapter)
+                        except Exception:
+                            pass
+                        _resp = None
+                        try:
+                            _resp = _session.get(url, timeout=http_timeout, headers=headers, stream=True, allow_redirects=True)
+                            _resp.raise_for_status()
+                            # 较大分块以提升吞吐
+                            chunk_size = 512 * 1024
+                            with open(temp_file, mode) as f:
+                                for chunk in _resp.iter_content(chunk_size=chunk_size):
+                                    if pause_event is not None and not pause_event.is_set():
+                                        while pause_event is not None and not pause_event.is_set():
+                                            if cancel_flag['cancelled']:
+                                                raise Exception("同步被用户取消")
+                                            time.sleep(0.1)
+                                    if cancel_flag['cancelled']:
+                                        raise Exception("同步被用户取消")
+                                    if not chunk:
+                                        continue
+                                    ModUtils._limit_speed(len(chunk))
+                                    f.write(chunk)
+                        finally:
+                            try:
+                                if _resp is not None:
+                                    _resp.close()
+                            except Exception:
+                                pass
+                            try:
+                                _session.close()
+                            except Exception:
+                                pass
                 finally:
                     progress_thread.stop()
                     progress_thread.join()
                     if 'response' in locals():
-                        response.close()
-                        response.release_conn()
+                        try:
+                            response['Body'].close()
+                        except Exception:
+                            pass
                 
                 # 验证文件完整性（仅检查文件大小）
                 is_valid, error_msg = ModUtils.verify_file(temp_file, expected_size=file_size, is_7z=False)
@@ -1133,12 +1429,19 @@ class ModUtils:
                     raise Exception("没有权限重命名文件")
                 
                 ModUtils.logger.info(f"文件下载完成: {final_file}")
+                # 仅标记内部状态，不对 UI 发100%完成信号，避免主线程误判任务已全部完成
+                try:
+                    if mod_id in ModUtils.download_status:
+                        ModUtils.download_status[mod_id] = 'downloaded'
+                except Exception:
+                    pass
                 return True
                 
             except Exception as e:
                 if str(e) == "同步被用户取消":
                     raise
-                if attempt == max_retries - 1:
+                # 不可重试错误直接失败
+                if not _is_retryable_error(e) or attempt == max_retries - 1:
                     ModUtils.logger.error(f"下载失败: {str(e)}")
                     raise Exception(f"下载模组失败: {str(e)}")
                 ModUtils.logger.warning(f"下载失败，正在重试 ({attempt + 1}/{max_retries}): {str(e)}")
@@ -1148,7 +1451,8 @@ class ModUtils:
                         os.remove(temp_file)
                     except:
                         pass
-                time.sleep(minio_config['settings']['retry_delay'])
+                # 指数退避 + 抖动
+                _backoff_sleep(attempt)
                 continue
         return False
 
@@ -1169,74 +1473,375 @@ class ModUtils:
         ]
 
     @staticmethod
-    def process_mods_parallel(local_path: str, to_update: List[str], to_add: List[str], local_mods: Dict[str, dict], remote_mods: Dict[str, dict], progress_callback: Optional[Callable] = None) -> Dict[str, str]:
-        """并行处理模组更新和下载"""
-        # 准备下载任务
-        download_tasks = []
-        
-        # 处理需要更新的模组
+    def prefetch_sizes(mod_ids: List[str], mod_list: Optional[str]) -> Dict[str, int]:
+        """预取一组模组的对象大小（字节）。
+        优先：一次性列举 S3 前缀（boto3 paginator），构建对象索引后批量匹配；
+        回退：基于候选键逐个探测（S3 head_object 或 HTTP HEAD）。
+        返回: { mod_id: size_bytes }
+        """
+        sizes: Dict[str, int] = {}
+        try:
+            remote_mods = ModUtils.get_remote_mods(mod_list)
+            settings = ModUtils.get_minio_settings() or {}
+            bucket = settings.get('bucket', '')
+            # 选择节点
+            node_name = ModUtils.get_best_node()
+            node_info = ModUtils.get_node_info(node_name) if node_name else None
+            http_mode = bool(node_info and (node_info.get('type') == 'r2_http' or 'public_url_base' in node_info))
+            client = None
+            if not http_mode and node_name:
+                try:
+                    client = ModUtils.get_minio_client(node_name)
+                except Exception:
+                    client = None
+            else:
+                # 即使处于 HTTP 模式，仍尝试获取任一可用 S3 节点用于列举
+                try:
+                    alt_node = ModUtils.get_best_node()
+                    if alt_node:
+                        client = ModUtils.get_minio_client(alt_node)
+                except Exception:
+                    client = None
+
+            # 一次性列举：构建 key -> size 列表缓存
+            obj_prefix = str(settings.get('object_prefix', 'uploads/1/mods')).strip('/')
+            list_prefix = obj_prefix + '/' if obj_prefix else ''
+            objects_index: List[Tuple[str, int]] = []
+            cache_key = (bucket, list_prefix)
+            # 磁盘缓存优先
+            def _load_objects_cache() -> List[Tuple[str, int]]:
+                try:
+                    if not os.path.exists(ModUtils.OBJECTS_LIST_CACHE_FILE):
+                        return []
+                    with open(ModUtils.OBJECTS_LIST_CACHE_FILE, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    rec = data.get(f"{bucket}|{list_prefix}")
+                    if not rec:
+                        return []
+                    ts = float(rec.get('time', 0))
+                    if time.time() - ts > ModUtils.OBJECTS_LIST_CACHE_TTL_SEC:
+                        return []
+                    entries = rec.get('entries') or []
+                    out: List[Tuple[str, int]] = []
+                    for it in entries:
+                        k = str(it.get('key', ''))
+                        if not k:
+                            continue
+                        s = int(it.get('size', 0) or 0)
+                        out.append((k, s))
+                    return out
+                except Exception:
+                    return []
+
+            def _save_objects_cache(objs: List[Tuple[str, int]]):
+                try:
+                    record = {
+                        'time': time.time(),
+                        'entries': [{'key': k, 'size': s} for (k, s) in objs]
+                    }
+                    data = {}
+                    if os.path.exists(ModUtils.OBJECTS_LIST_CACHE_FILE):
+                        try:
+                            with open(ModUtils.OBJECTS_LIST_CACHE_FILE, 'r', encoding='utf-8') as f:
+                                data = json.load(f) or {}
+                        except Exception:
+                            data = {}
+                    data[f"{bucket}|{list_prefix}"] = record
+                    with open(ModUtils.OBJECTS_LIST_CACHE_FILE, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False)
+                except Exception:
+                    pass
+
+            # 内存缓存或磁盘缓存
+            with ModUtils._index_lock:
+                if cache_key in ModUtils._r2_index_cache and ModUtils._r2_index_cache[cache_key]:
+                    objects_index = ModUtils._r2_index_cache[cache_key]
+                else:
+                    objects_index = _load_objects_cache()
+                    if objects_index:
+                        ModUtils._r2_index_cache[cache_key] = objects_index
+
+            if client and bucket and not objects_index:
+                try:
+                    paginator = client.get_paginator('list_objects_v2')
+                    for page in paginator.paginate(Bucket=bucket, Prefix=list_prefix):
+                        for obj in page.get('Contents', []) or []:
+                            k = str(obj.get('Key', ''))
+                            if not k:
+                                continue
+                            s = int(obj.get('Size', 0) or 0)
+                            objects_index.append((k, s))
+                    with ModUtils._index_lock:
+                        ModUtils._r2_index_cache[cache_key] = objects_index
+                    _save_objects_cache(objects_index)
+                except Exception:
+                    # 列举失败则回退到逐项探测
+                    objects_index = []
+ 
+            for mid in mod_ids:
+                try:
+                    if mid not in remote_mods:
+                        continue
+                    info = remote_mods[mid]
+                    filename = info.get('filename', f"{info.get('name','mod')}_{mid}.7z")
+                    name = info.get('name', '')
+                    version = info.get('version', '')
+                    obj_prefix = str(settings.get('object_prefix', 'uploads/1/mods')).strip('/')
+                    key_template = str(settings.get('object_key_template', '')).strip()
+
+                    # 候选键
+                    candidates: List[str] = []
+                    # 已解析/缓存
+                    if mid in ModUtils._resolved_keys:
+                        candidates.append(str(ModUtils._resolved_keys[mid]).lstrip('/'))
+                    raw_path = str(info.get('path') or '').strip()
+                    if raw_path:
+                        candidates.append(raw_path.lstrip('/'))
+                    if key_template:
+                        try:
+                            rendered = key_template.format(
+                                object_prefix=obj_prefix,
+                                mod_id=mid,
+                                filename=filename,
+                                name=name,
+                                version=version,
+                            ).strip('/').replace('\\', '/')
+                            if rendered:
+                                candidates.append(rendered)
+                        except Exception:
+                            pass
+                    norm_filename = str(filename).lstrip('/').replace('\\', '/')
+                    if obj_prefix:
+                        candidates.append(f"{obj_prefix}/{norm_filename}")
+                    candidates.append(norm_filename)
+
+                    # 去重
+                    seen = set(); ordered = []
+                    for c in candidates:
+                        c = c.replace('\\', '/').lstrip('/')
+                        if c and c not in seen:
+                            seen.add(c); ordered.append(c)
+
+                    # 优先用一次性列举的索引批量匹配（按后缀匹配，兼容随机前缀）
+                    matched = False
+                    if objects_index:
+                        # 构造后缀集合：完整文件名、_mod_id.7z、filename
+                        suffixes = []
+                        suffixes.append('/' + norm_filename)
+                        suffixes.append('_' + mid + '.7z')
+                        suffixes.append(norm_filename)
+                        for key, sz in objects_index:
+                            for suf in suffixes:
+                                if key.endswith(suf):
+                                    sizes[mid] = int(sz)
+                                    with ModUtils._index_lock:
+                                        ModUtils._resolved_keys[mid] = key
+                                    matched = True
+                                    break
+                            if matched:
+                                break
+
+                    # 若未匹配上，回退到逐项探测
+                    if not matched:
+                        if http_mode and node_info:
+                            base = node_info.get('public_url_base')
+                            include_bucket = bool(node_info.get('bucket_in_path', True))
+                            for key in ordered:
+                                try:
+                                    url = f"{base.rstrip('/')}/{bucket}/{key}" if include_bucket else f"{base.rstrip('/')}/{key}"
+                                    resp = requests.head(url, timeout=max(2, ModUtils.CONFIG_SERVER['timeout']), headers=ModUtils.build_headers('*/*'), allow_redirects=True)
+                                    if resp.status_code < 400 and resp.headers.get('Content-Length'):
+                                        sizes[mid] = int(resp.headers['Content-Length'])
+                                        with ModUtils._index_lock:
+                                            ModUtils._resolved_keys[mid] = key
+                                        matched = True
+                                        break
+                                except Exception:
+                                    continue
+                        else:
+                            if client:
+                                for key in ordered:
+                                    try:
+                                        st = client.head_object(Bucket=bucket, Key=key)
+                                        sizes[mid] = int(st.get('ContentLength', 0) or 0)
+                                        with ModUtils._index_lock:
+                                            ModUtils._resolved_keys[mid] = key
+                                        matched = True
+                                        break
+                                    except Exception:
+                                        continue
+                except Exception:
+                    continue
+        except Exception:
+            return sizes
+        return sizes
+
+    @staticmethod
+    def download_mods_parallel(mod_ids: List[str], target_path: str, progress_callback: Optional[Callable] = None, preferred_node: Optional[str] = None, mod_list: Optional[str] = None, max_workers: Optional[int] = None, pause_event: Optional[threading.Event] = None) -> Dict[str, str]:
+        """并行下载多个模组
+        Args:
+            mod_ids: 需要下载的模组ID列表
+            target_path: 本地保存路径
+            progress_callback: 进度回调（总体或分项）
+            preferred_node: 指定节点
+            mod_list: 指定模组列表
+            max_workers: 线程数（默认取配置 settings.max_workers 或 4）
+        Returns:
+            dict: {mod_id: 状态(成功/失败原因)}
+        """
+        results: Dict[str, str] = {}
+        try:
+            settings = ModUtils.get_minio_settings() or {}
+            if max_workers is None:
+                suggested = max(1, (os.cpu_count() or 2) * 2)
+                max_workers = min(int(settings.get('max_workers', 4)), suggested)
+
+            # 第一步：一次性解析所有真实对象键与大小
+            key_map: Dict[str, Tuple[str, int]] = {}
+            try:
+                # 复用预取尺寸逻辑，填充大小
+                size_map = ModUtils.prefetch_sizes(mod_ids, mod_list)
+                # 将已解析键缓存带入 key_map
+                for mid in mod_ids:
+                    resolved_key = ModUtils._resolved_keys.get(mid)
+                    if resolved_key:
+                        key_map[mid] = (resolved_key, int(size_map.get(mid, 0)))
+            except Exception:
+                pass
+
+            def task(mod_id: str) -> Tuple[str, str]:
+                try:
+                    resolved_key, sz = key_map.get(mod_id, (None, None))
+                    ok = ModUtils.download_mod(
+                        mod_id,
+                        target_path,
+                        progress_callback=progress_callback,
+                        preferred_node=preferred_node,
+                        mod_list=mod_list,
+                        resolved_path=resolved_key,
+                        expected_size_override=sz if isinstance(sz, int) and sz > 0 else None,
+                        pause_event=pause_event,
+                    )
+                    return mod_id, ("成功" if ok else "失败")
+                except Exception as e:
+                    return mod_id, f"失败: {ModUtils.categorize_error_message(e)}"
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {executor.submit(task, m): m for m in mod_ids}
+                for future in concurrent.futures.as_completed(future_map):
+                    mod_id, status = future.result()
+                    results[mod_id] = status
+        except Exception as e:
+            ModUtils.logger.error(f"并行下载失败: {str(e)}")
+        return results
+
+    @staticmethod
+    def process_mods_parallel(local_path: str, to_update: List[str], to_add: List[str], local_mods: Dict[str, dict], remote_mods: Dict[str, dict], progress_callback: Optional[Callable] = None, pause_event: Optional[threading.Event] = None) -> Dict[str, str]:
+        """并行处理：每个模组下载完成后立即解压，避免等待全部下载完成导致的延迟或取消时未解压。"""
+        tasks: List[Tuple[str, str, str]] = []  # (mod_id, mod_name, mod_path)
         for mod_id in to_update:
             mod_name = local_mods[mod_id]['name']
-            mod_path = os.path.join(local_path, f"{mod_name}_{mod_id}")
-            download_tasks.append((mod_id, mod_name, mod_path))
-            
-        # 处理需要新增的模组
+            mod_path = ModUtils.build_target_mod_path(local_path, mod_name, mod_id)
+            tasks.append((mod_id, mod_name, mod_path))
         for mod_id in to_add:
             mod_name = remote_mods[mod_id]['name']
-            mod_path = os.path.join(local_path, f"{mod_name}_{mod_id}")
+            mod_path = ModUtils.build_target_mod_path(local_path, mod_name, mod_id)
             os.makedirs(mod_path, exist_ok=True)
-            download_tasks.append((mod_id, mod_name, mod_path))
-            
-        # 并发下载
-        download_status = ModUtils.download_mods_parallel(
-            [task[0] for task in download_tasks],
-            local_path,
-            progress_callback
-        )
-        
-        # 处理下载结果
-        results = {}
-        for mod_id, mod_name, mod_path in download_tasks:
-            status = download_status.get(mod_id, "未知")
-            
-            if status == "完成":
-                try:
-                    # 使用完整的文件名
-                    remote_filename = remote_mods[mod_id].get('filename', f"{mod_name}_{mod_id}.7z")
-                    archive_path = os.path.join(local_path, remote_filename)
-                    logging.info(f"准备解压文件: {archive_path}")
-                    
-                    if not os.path.exists(archive_path):
-                        # 尝试使用旧的文件名格式
-                        old_archive_path = os.path.join(local_path, f"{mod_id}.7z")
-                        if os.path.exists(old_archive_path):
-                            archive_path = old_archive_path
-                            logging.info(f"使用旧文件名格式: {archive_path}")
-                        else:
-                            raise Exception(f"模组文件不存在: {archive_path}")
-                    
-                    # 验证文件完整性
-                    is_valid, error_msg = ModUtils.verify_file(archive_path, is_7z=True)
-                    if not is_valid:
-                        raise Exception(f"文件验证失败: {error_msg}")
-                    
-                    # 解压文件
-                    if ModUtils.extract_mod(archive_path, mod_path):
-                        # 清理下载的7z文件
-                        try:
-                            os.remove(archive_path)
-                            logging.info(f"清理下载文件: {archive_path}")
-                        except Exception as e:
-                            logging.error(f"清理下载文件失败: {str(e)}")
-                        results[mod_id] = "成功"
+            tasks.append((mod_id, mod_name, mod_path))
+
+        results: Dict[str, str] = {}
+        results_lock = threading.Lock()
+
+        def do_one(mod_id: str, mod_name: str, mod_path: str) -> Tuple[str, str]:
+            try:
+                # 下载前再次确认根目录权限
+                ok_perm_root, perr_root = ModUtils.check_path_permissions(local_path)
+                if not ok_perm_root:
+                    return mod_id, f"失败: 目标路径权限错误: {perr_root}"
+
+                ok = ModUtils.download_mod(
+                    mod_id,
+                    local_path,
+                    progress_callback=progress_callback,
+                    preferred_node=None,
+                    mod_list=None,
+                    pause_event=pause_event,
+                )
+                if not ok:
+                    return mod_id, "下载失败"
+
+                # 解压前检查目标父目录权限
+                remote_filename = remote_mods[mod_id].get('filename', f"{mod_name}_{mod_id}.7z")
+                archive_path = os.path.join(local_path, remote_filename)
+                logging.info(f"准备解压文件: {archive_path}")
+                parent_dir = os.path.dirname(mod_path) or local_path
+                ok_perm, perr = ModUtils.check_path_permissions(parent_dir)
+                if not ok_perm:
+                    return mod_id, f"失败: 目标路径权限错误: {perr}"
+                if not os.path.exists(archive_path):
+                    # 等待文件系统落盘片刻
+                    import time as _t
+                    _t.sleep(0.1)
+                if not os.path.exists(archive_path):
+                    # 回退1：旧文件名
+                    alt = os.path.join(local_path, f"{mod_id}.7z")
+                    if os.path.exists(alt):
+                        archive_path = alt
+                        logging.info(f"使用旧文件名格式: {archive_path}")
                     else:
-                        results[mod_id] = "解压失败"
-                except Exception as e:
-                    results[mod_id] = f"处理失败: {str(e)}"
-            else:
-                results[mod_id] = status
-                
-        return results 
+                        # 回退2：根据后缀匹配目录中符合 _{mod_id}.7z 的文件
+                        try:
+                            candidates = [f for f in os.listdir(local_path) if f.lower().endswith(f"_{mod_id.lower()}.7z")]
+                        except Exception:
+                            candidates = []
+                        if candidates:
+                            archive_path = os.path.join(local_path, candidates[0])
+                            logging.info(f"使用匹配文件名: {archive_path}")
+                        else:
+                            return mod_id, "失败: 模组文件不存在"
+                is_valid, error_msg = ModUtils.verify_file(archive_path, is_7z=True)
+                if not is_valid:
+                    return mod_id, f"失败: 文件验证失败: {error_msg}"
+                # 确保目标目录可写
+                ok_perm, perr = ModUtils.check_path_permissions(os.path.dirname(mod_path))
+                if not ok_perm:
+                    return mod_id, f"失败: 目标目录权限不足: {perr}"
+
+                if ModUtils.extract_mod(archive_path, mod_path):
+                    # 在删除前记录文件大小，用于发送最终完成信号
+                    try:
+                        final_size = os.path.getsize(archive_path)
+                    except Exception:
+                        final_size = None
+                    # 发送完成信号：进度100%、速度0、ETA 0、已下载=总大小
+                    try:
+                        if progress_callback and final_size is not None:
+                            progress_callback(mod_id, 100.0, 0, 0, final_size, final_size)
+                    except Exception:
+                        pass
+                    # 清理下载的7z文件
+                    try:
+                        os.remove(archive_path)
+                        logging.info(f"清理下载文件: {archive_path}")
+                    except Exception as e:
+                        logging.warning(f"清理下载文件失败: {str(e)}")
+                    return mod_id, "成功"
+                return mod_id, "解压失败"
+            except Exception as e:
+                return mod_id, f"失败: {ModUtils.categorize_error_message(e)}"
+
+        settings = ModUtils.get_minio_settings() or {}
+        suggested = max(1, (os.cpu_count() or 2) * 2)
+        max_workers = min(int(settings.get('max_workers', 4)), suggested)
+        # 采用线程池：任务完成后立刻回收、立刻执行后续解压逻辑（已在 do_one 内部完成）
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_map = {ex.submit(do_one, mid, name, path): mid for (mid, name, path) in tasks}
+            for fut in concurrent.futures.as_completed(future_map):
+                mid, st = fut.result()
+                with results_lock:
+                    results[mid] = st
+
+        return results
 
     @staticmethod
     def restore_from_backup(backup_path: str, target_path: str) -> bool:
@@ -1265,33 +1870,37 @@ class ModUtils:
         """
         try:
             import py7zr
-            
+
+            logging.info(f"开始解压: {archive_path} -> {target_path}")
+
             # 创建临时目录进行解压
             temp_extract_path = f"{target_path}_temp_extract"
             if os.path.exists(temp_extract_path):
                 shutil.rmtree(temp_extract_path)
             os.makedirs(temp_extract_path, exist_ok=True)
-            
-            # 先解压到临时目录
+
+            # 流式解压：避免一次性占用过多内存
             with py7zr.SevenZipFile(archive_path, mode='r') as z:
                 z.extractall(temp_extract_path)
-            
+
             # 检查解压后的文件结构
             extracted_items = os.listdir(temp_extract_path)
-            
+            logging.info(f"解压完成，临时目录包含 {len(extracted_items)} 项: {extracted_items[:5]}{'...' if len(extracted_items)>5 else ''}")
+
             # 如果只有一个文件夹且该文件夹名与目标文件夹名相同
             if len(extracted_items) == 1 and os.path.isdir(os.path.join(temp_extract_path, extracted_items[0])):
                 inner_folder = os.path.join(temp_extract_path, extracted_items[0])
                 folder_name = extracted_items[0]
-                
+
                 # 如果解压出来的文件夹名与目标文件夹名相同，说明有嵌套
                 if folder_name == os.path.basename(target_path):
+                    logging.info("检测到与目标同名的嵌套目录，执行内容合并覆盖")
                     # 确保目标文件夹存在并为空
                     if os.path.exists(target_path):
                         shutil.rmtree(target_path)
                     os.makedirs(target_path, exist_ok=True)
-                    
-                    # 移动内部文件夹中的所有内容到目标路径
+
+                    # 移动内部文件夹中的所有内容到目标路径（逐项复制，遇到同名先删再覆盖）
                     for item in os.listdir(inner_folder):
                         src_path = os.path.join(inner_folder, item)
                         dst_path = os.path.join(target_path, item)
@@ -1300,22 +1909,28 @@ class ModUtils:
                                 shutil.rmtree(dst_path)
                             shutil.copytree(src_path, dst_path)
                         else:
+                            # 覆盖写入
+                            if os.path.exists(dst_path):
+                                os.remove(dst_path)
                             shutil.copy2(src_path, dst_path)
                 else:
+                    logging.info("检测到单一根目录，与目标不同名，执行整体移动为目标目录")
                     # 目标文件夹不存在，直接重命名
                     if os.path.exists(target_path):
                         shutil.rmtree(target_path)
                     shutil.move(inner_folder, target_path)
             else:
                 # 有多个文件/文件夹，直接移动所有内容
+                logging.info("检测到多项内容，整体迁移到目标目录")
                 if os.path.exists(target_path):
                     shutil.rmtree(target_path)
                 shutil.move(temp_extract_path, target_path)
-            
+
             # 清理临时目录
             if os.path.exists(temp_extract_path):
                 shutil.rmtree(temp_extract_path)
-                
+
+            logging.info(f"解压完成，目标目录: {target_path}")
             return True
         except Exception as e:
             logging.error(f"解压模组失败: {str(e)}")

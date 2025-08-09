@@ -6,7 +6,7 @@
 - 支持多节点下载
 - 智能负载均衡
 - 断点续传
-- 下载速度限制（0-200Mbps）
+- 下载速度限制（0-1000Mbps）
 - 自动备份和恢复
 - 实时进度显示
 - 详细的日志记录
@@ -23,7 +23,7 @@
 
 ### 下载速度限制
 - 使用滑动条或输入框设置下载速度
-- 范围：0-200Mbps
+- 范围：0-1000Mbps
 - 0表示不限制下载速度
 - 建议根据网络情况设置合适的速度
 - 可以随时调整下载速度
@@ -69,7 +69,7 @@
 - Python 3.8 或更高版本
 - 必要的 Python 包：
   ```bash
-  pip install minio py7zr requests semver
+  pip install boto3 py7zr requests semver
   ```
 
 ### 2. 配置文件结构
@@ -97,33 +97,32 @@
 }
 ```
 
-3. `minio_config.json` - MinIO 配置
+3. `minio_config.json` - MinIO 配置（示例）
 ```json
 {
-    "settings": {
-        "bucket": "你的存储桶名称",
-        "timeout": 30,
-        "retry_count": 3,
-        "retry_delay": 1,
-        "max_workers": 4
-    },
-    "MinIO节点一": {
-        "endpoint": "你的节点地址",
-        "port": 9000,
-        "access_key": "访问密钥",
-        "secret_key": "密钥",
-        "secure": false,
-        "region": "auto"
-    }，
-    "MinIO节点二: {
-        "endpoint": "你的节点地址",
-        "port": 9000,
-        "access_key": "访问密钥",
-        "secret_key": "密钥",
-        "secure": false,
-        "region": "auto"
-    }
-
+  "settings": {
+    "bucket": "你的存储桶名称",
+    "timeout": 30,
+    "retry_count": 3,
+    "retry_delay": 1,
+    "max_workers": 4
+  },
+  "MinIO节点一": {
+    "endpoint": "你的节点地址",
+    "port": 9000,
+    "access_key": "访问密钥",
+    "secret_key": "密钥",
+    "secure": false,
+    "region": "auto"
+  },
+  "MinIO节点二": {
+    "endpoint": "你的节点地址",
+    "port": 9000,
+    "access_key": "访问密钥",
+    "secret_key": "密钥",
+    "secure": false,
+    "region": "auto"
+  }
 }
 ```
 
@@ -228,6 +227,30 @@ ModUtils.download_mod('mod_id', '目标路径')
    - 分析错误率
 
 ## 更新日志
+
+### [3.0.0] - 2025-08-10
+
+#### 核心变更
+- 切换至 Cloudflare R2 官方 SDK（boto3，S3 兼容），移除 MinIO 依赖；保留现有 `minio_config.json` 文件名作为 R2 节点与全局参数配置入口。
+- R2 对象键解析优化：支持一次性列举前缀+后缀匹配、`path`/`object_key_template` 多方案，无需额外索引文件。
+- 下载→解压流水线：单个模组下载完成后立即进行完整性校验、解压并删除 7z 文件。
+
+#### 可靠性与可观测性
+- 精准速度与 ETA：采用增量字节/时间的瞬时速率；总速度仅聚合活跃任务，避免已完成任务干扰。
+- 暂停/继续 与 取消：下载循环尊重暂停；取消与窗口关闭将安全停止并清理临时文件。
+- 权限与空间预检：下载/解压前分别校验目标目录写入/删除权限；基于预取大小与磁盘剩余空间做下载前校验并给出提示。
+- 错误分级：将异常归类为“网络超时/连接错误/对象不存在/权限不足/限流/服务端错误/空间不足/校验失败”等，便于定位问题。
+- 日志系统：日志默认写入 `%USERPROFILE%/Documents/mod_sync_tool/`，按天轮转保留 7 天。
+
+#### 性能与体验
+- 速度限制上限提升至 0–1000 Mbps；可随时调整。
+- 吞吐优化：HTTP keep-alive、较大分块（S3/HTTP）与线程数自适应，提升大文件与“最后一个文件”下载性能。
+- 列表与交互：状态高亮（成功“已同步”绿色、失败红色）；右键菜单新增“打开选中模组目录/打开日志目录”。
+
+#### 修复
+- 统一“成功”触发解压逻辑，修复“下载成功但不解压”的问题。
+- 解决提前发送 100% 完成导致的误完成问题；完成信号改为解压成功后发送。
+- 改进 7z 校验为“头部+目录解析”，避免大文件二次全面 test 卡顿。
 
 ### 版本 2.1.0 (2025-05-14)
 

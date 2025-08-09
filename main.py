@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from mod_utils import ModUtils
 import logging
+from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
 import threading
 import time
@@ -14,7 +15,7 @@ import shutil
 class MainWindow:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("TASK军事模拟俱乐部武装突袭重铸者模组同步器 V2.1.2")
+        self.root.title("TASK军事模拟俱乐部武装突袭重铸者模组同步器 V3.0.0")
         self.root.geometry("1000x800")  # 减小窗口大小
         
         self.setup_logging()
@@ -26,23 +27,31 @@ class MainWindow:
         
     def setup_logging(self):
         """设置日志系统"""
-        # 创建日志目录
-        log_dir = "logs"
+        # 创建日志目录到用户文档目录
+        log_dir = os.path.join(os.path.expanduser("~"), "Documents", "mod_sync_tool")
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
-            
-        # 设置日志文件名（使用当前日期）
-        log_file = os.path.join(log_dir, f"mod_sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-        
-        # 配置日志格式
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s [%(levelname)s] %(message)s',
-            handlers=[
-                logging.FileHandler(log_file, encoding='utf-8'),
-                logging.StreamHandler()
-            ]
+
+        # 轮转日志：按天分割，保留7天
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+        # 清理可能的旧处理器避免重复
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+
+        formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+        file_handler = TimedRotatingFileHandler(
+            filename=os.path.join(log_dir, 'mod_sync.log'),
+            when='midnight',
+            backupCount=7,
+            encoding='utf-8',
+            utc=False
         )
+        file_handler.setFormatter(formatter)
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
         
     def setup_ui(self):
         # 创建主框架
@@ -121,7 +130,7 @@ class MainWindow:
         self.speed_scale = ttk.Scale(
             speed_frame,
             from_=0,
-            to=200,
+            to=1000,
             orient=tk.HORIZONTAL,
             variable=self.speed_var,
             command=self.on_speed_change
@@ -197,7 +206,7 @@ class MainWindow:
         list_frame.rowconfigure(0, weight=1)
         
         # 创建Treeview
-        columns = ('name', 'local_version', 'remote_version', 'status')
+        columns = ('name', 'local_version', 'remote_version', 'status', 'progress', 'rate')
         self.tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=25)  # 增加高度
         
         # 设置列标题
@@ -205,12 +214,16 @@ class MainWindow:
         self.tree.heading('local_version', text='本地版本', command=lambda: self.sort_treeview('local_version', False))
         self.tree.heading('remote_version', text='云端版本', command=lambda: self.sort_treeview('remote_version', False))
         self.tree.heading('status', text='状态', command=lambda: self.sort_treeview('status', False))
+        self.tree.heading('progress', text='进度', command=lambda: self.sort_treeview('progress', False))
+        self.tree.heading('rate', text='速度/剩余', command=lambda: self.sort_treeview('rate', False))
         
         # 设置列宽
         self.tree.column('name', width=250)  # 减小宽度
         self.tree.column('local_version', width=80)  # 减小宽度
         self.tree.column('remote_version', width=80)  # 减小宽度
         self.tree.column('status', width=100)  # 减小宽度
+        self.tree.column('progress', width=80)
+        self.tree.column('rate', width=180)
         
         # 添加滚动条
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
@@ -222,6 +235,13 @@ class MainWindow:
         
         # 添加右键菜单
         self.create_context_menu()
+
+        # 配置行样式（高亮失败/成功）
+        try:
+            self.tree.tag_configure('failed', foreground='red')
+            self.tree.tag_configure('synced', foreground='green')
+        except Exception:
+            pass
         
     def create_context_menu(self):
         """创建右键菜单"""
@@ -231,6 +251,9 @@ class MainWindow:
         self.context_menu.add_command(label="按云端版本排序", command=lambda: self.sort_treeview('remote_version', False))
         self.context_menu.add_command(label="按状态排序", command=lambda: self.sort_treeview('status', False))
         self.context_menu.add_separator()
+        self.context_menu.add_command(label="打开选中模组目录", command=self.open_selected_mod_folder)
+        self.context_menu.add_command(label="打开日志目录", command=self.open_log_folder)
+        self.context_menu.add_separator()
         self.context_menu.add_command(label="反向排序", command=self.reverse_sort)
         
         # 绑定右键菜单
@@ -239,6 +262,35 @@ class MainWindow:
     def show_context_menu(self, event):
         """显示右键菜单"""
         self.context_menu.post(event.x_root, event.y_root)
+
+    def open_log_folder(self):
+        try:
+            log_dir = os.path.join(os.path.expanduser("~"), "Documents", "mod_sync_tool")
+            if os.path.exists(log_dir):
+                os.startfile(log_dir)
+        except Exception as e:
+            self.log_message(f"打开日志目录失败: {str(e)}", logging.ERROR)
+
+    def open_selected_mod_folder(self):
+        try:
+            selection = self.tree.selection()
+            if not selection:
+                return
+            mod_id = selection[0]
+            values = list(self.tree.item(mod_id).get('values', []))
+            name = values[0] if values else mod_id
+            base = self.local_path_var.get()
+            # 首选直接用 name 作为目录名
+            candidates = [os.path.join(base, name), os.path.join(base, f"{name}_{mod_id}")]
+            for p in candidates:
+                if os.path.exists(p):
+                    os.startfile(p)
+                    return
+            # 若都不存在，打开基目录
+            if os.path.exists(base):
+                os.startfile(base)
+        except Exception as e:
+            self.log_message(f"打开模组目录失败: {str(e)}", logging.ERROR)
         
     def sort_treeview(self, col, reverse):
         """排序列表"""
@@ -270,6 +322,12 @@ class MainWindow:
                     '下载失败': 5
                 }
                 return (status_order.get(value, 999), value)
+            elif col in ['progress']:
+                # 进度百分比排序，形如 '12.3%'
+                try:
+                    return (0, float(value.strip('% ')))
+                except Exception:
+                    return (1, 0.0)
             else:
                 # 其他列按字符串排序
                 return (0, value.lower())
@@ -385,7 +443,7 @@ class MainWindow:
                 remote_info = remote_mods.get(mod_id, {})
                 remote_version = remote_info.get('version', 'unknown')
                 status = ModUtils.compare_versions(info['version'], remote_version)
-                self.tree.insert('', 'end', values=(
+                self.tree.insert('', 'end', iid=mod_id, values=(
                     info['name'],
                     info['version'],
                     remote_version,
@@ -395,7 +453,7 @@ class MainWindow:
             for mod_id in to_add:
                 info = remote_mods[mod_id]
                 status = ModUtils.compare_versions('', info['version'])
-                self.tree.insert('', 'end', values=(
+                self.tree.insert('', 'end', iid=mod_id, values=(
                     info['name'],
                     '未安装',
                     info['version'],
@@ -474,6 +532,30 @@ class MainWindow:
                 
                 # 比较模组
                 to_update, to_add, to_remove = ModUtils.compare_mods(local_mods, remote_mods)
+
+                # 磁盘空间预检
+                all_targets = to_update + to_add
+                if all_targets:
+                    try:
+                        size_map = ModUtils.prefetch_sizes(all_targets, selected_list)
+                    except Exception:
+                        size_map = {}
+                    total_need = sum(int(size_map.get(mid, 0) or 0) for mid in all_targets)
+                    try:
+                        usage = shutil.disk_usage(self.local_path_var.get())
+                        free_bytes = usage.free
+                    except Exception:
+                        free_bytes = 0
+                    # 预留 1GB 余量
+                    reserve = 1 * 1024 * 1024 * 1024
+                    if free_bytes and total_need and total_need > max(0, free_bytes - reserve):
+                        msg = (
+                            f"空间不足：预计需要 {total_need/1024/1024/1024:.2f} GB，"
+                            f"当前可用 {free_bytes/1024/1024/1024:.2f} GB。请清理磁盘后重试。"
+                        )
+                        logging.error(msg)
+                        messagebox.showerror("空间不足", msg)
+                        return
                 
                 if not to_update and not to_add:
                     messagebox.showinfo("提示", "所有模组已是最新版本")
@@ -489,12 +571,17 @@ class MainWindow:
                     preferred_node
                 )
                 
-                # 显示结果
+                # 显示结果（增强原因统计）
                 success_count = sum(1 for status in results.values() if status == "成功")
                 failed_count = len(results) - success_count
                 failed_mods = {mod_id: status for mod_id, status in results.items() if status != "成功"}
+                # 统计权限相关失败
+                perm_fails = [m for m, s in failed_mods.items() if isinstance(s, str) and ("权限" in s or "访问" in s)]
                 
                 self.show_sync_result(success_count, failed_count, failed_mods)
+                if perm_fails:
+                    logging.warning("检测到权限相关失败的模组：" + ", ".join(perm_fails))
+                    logging.warning("建议以管理员身份运行或检查目标目录NTFS权限与安全软件拦截")
                 
             except Exception as e:
                 messagebox.showerror("错误", f"同步失败: {str(e)}")
@@ -520,130 +607,124 @@ class MainWindow:
                 node = preferred_node
                 if node:
                     logging.info(f"使用指定节点: {node}")
-                
-                # 处理需要更新的模组
-                for mod_id in to_update:
+
+                # 并行处理下载与解压
+                # 进度聚合：总体进度 + 当前文件
+                aggregate = {
+                    'mod_bytes': {},    # mid -> downloaded bytes
+                    'mod_totals': {},   # mid -> total bytes
+                    'speeds': {},       # mid -> bytes/s
+                }
+                last_ui_update = {'t': 0.0}
+                MIN_UPDATE_INTERVAL = 0.2  # 秒，限流UI刷新，避免闪烁
+
+                def download_callback(mid, p, s=0, e=0, cur_bytes=0, total_bytes=0):
                     if self.cancel_event.is_set():
-                        break
-                        
-                    mod_name = local_mods[mod_id]['name']
-                    old_mod_path = local_mods[mod_id]['path']
-                        
+                        return False
+                    # 更新分项数据
+                    if total_bytes and total_bytes > 0:
+                        aggregate['mod_totals'][mid] = total_bytes
+                    aggregate['mod_bytes'][mid] = max(cur_bytes, aggregate['mod_bytes'].get(mid, 0))
+                    aggregate['speeds'][mid] = s
+                    # 更新表格该行的“进度/速度/ETA”
                     try:
-                        # 下载模组
-                        def download_callback(p, s=0, e=0):
-                            if not self.cancel_event.is_set():
-                                self.update_progress(p, s, e)
-                                
-                        success = ModUtils.download_mod(
-                            mod_id,
-                            local_path,
-                            progress_callback=download_callback,
-                            preferred_node=node,
-                            mod_list=selected_list  # 传递选择的模组列表
-                        )
-                        
-                        if success:
-                            # 使用完整的文件名
-                            remote_filename = remote_mods[mod_id].get('filename', f"{mod_name}_{mod_id}.7z")
-                            archive_path = os.path.join(local_path, remote_filename)
-                            
-                            # 确保模组文件夹名称与7Z文件名一致
-                            folder_name = os.path.splitext(remote_filename)[0]  # 移除.7z后缀
-                            target_folder = os.path.join(local_path, folder_name)
-                            
-                            # 检查旧文件夹是否存在
-                            if os.path.exists(old_mod_path):
-                                # 如果旧文件夹路径与期望的新路径不同，则保存旧路径以备检查
-                                if old_mod_path != target_folder:
-                                    logging.info(f"更新模组: 检测到路径变更 {old_mod_path} -> {target_folder}")
-                                    # 如果目标文件夹已存在，需要先删除
-                                    if os.path.exists(target_folder):
-                                        logging.info(f"删除已存在的目标文件夹: {target_folder}")
-                                        shutil.rmtree(target_folder)
-                            
-                            # 提取文件到正确位置
-                            if ModUtils.extract_mod(archive_path, target_folder):
-                                # 如果旧文件夹路径与新路径不同，且旧文件夹仍然存在，则删除旧文件夹
-                                if old_mod_path != target_folder and os.path.exists(old_mod_path):
-                                    try:
-                                        logging.info(f"删除旧文件夹: {old_mod_path}")
-                                        shutil.rmtree(old_mod_path)
-                                    except Exception as e:
-                                        logging.error(f"删除旧文件夹失败: {str(e)}")
-                                
-                                # 清理下载的7z文件
-                                try:
-                                    os.remove(archive_path)
-                                    logging.info(f"清理下载文件: {archive_path}")
-                                except Exception as e:
-                                    logging.error(f"清理下载文件失败: {str(e)}")
-                                results[mod_id] = "成功"
-                            else:
-                                results[mod_id] = "解压失败"
-                        else:
-                            results[mod_id] = "下载失败"
-                            
-                    except Exception as e:
-                            results[mod_id] = f"处理失败: {str(e)}"
-                            
-                    # 更新树形视图
-                    self.update_tree_item(mod_id, results[mod_id])
-                    
-                # 处理需要新增的模组
-                for mod_id in to_add:
-                    if self.cancel_event.is_set():
-                        break
-                        
-                    mod_name = remote_mods[mod_id]['name']
-                    
+                        item = mid
+                        row = self.tree.item(item)
+                        if row and row.get('values'):
+                            values = list(row['values'])
+                            # 确保列索引存在：name, local_version, remote_version, status, progress, rate
+                            while len(values) < 6:
+                                values.append("")
+                            values[4] = f"{p:.1f}%"
+                            speed_text = f"{s/1024/1024:.1f} MB/s"
+                            eta_text = f"{e/60:.1f} 分钟" if e > 0 else "计算中..."
+                            values[5] = f"{speed_text} / {eta_text}"
+                            self.tree.item(item, values=values)
+                    except Exception:
+                        pass
+
+                    # 计算总体进度
+                    overall_total = sum(aggregate['mod_totals'].values()) or 0
+                    overall_done = 0
+                    for k, v in aggregate['mod_bytes'].items():
+                        overall_done += min(v, aggregate['mod_totals'].get(k, v))
+
+                    if overall_total > 0:
+                        overall_progress = overall_done / overall_total * 100.0
+                    else:
+                        overall_progress = p  # 退化到当前文件
+
+                    # 计算总体速度：仅汇总活跃任务（最近1秒有增量）
+                    combined_speed = 0.0
+                    # 仅统计仍在进行的任务速度（根据 done/total 判定），避免已完成任务残留速度
+                    for mid_k, total in aggregate['mod_totals'].items():
+                        done = aggregate['mod_bytes'].get(mid_k, 0)
+                        spd = aggregate['speeds'].get(mid_k, 0.0) or 0.0
+                        if done < total and spd > 0:
+                            combined_speed += spd
+                    remaining = max(overall_total - overall_done, 0)
+                    overall_eta = (remaining / combined_speed) if combined_speed > 0 else 0
+
+                    # 节流 UI 更新并切回主线程
+                    import time as _t
+                    now = _t.time()
+                    if now - last_ui_update['t'] < MIN_UPDATE_INTERVAL:
+                        return True
+                    last_ui_update['t'] = now
+
+                    def do_update():
+                        try:
+                            # 总进度取聚合值，但不将“下载完成但未解压”的任务当作完全完成；此处仅显示下载层面的聚合
+                            self.progress_var.set(overall_progress)
+                            overall_speed_text = f"{combined_speed/1024/1024:.1f} MB/s"
+                            overall_eta_text = f"{overall_eta/60:.1f} 分钟" if overall_eta > 0 else "计算中..."
+                            current_speed_text = f"{s/1024/1024:.1f} MB/s"
+                            current_eta_text = f"{e/60:.1f} 分钟" if e > 0 else "计算中..."
+                            self.status_var.set(
+                                f"总体 {overall_progress:.1f}% ({overall_speed_text}, 剩余 {overall_eta_text}) | "
+                                f"当前 {mid}: {p:.1f}% ({current_speed_text}, 剩余 {current_eta_text})"
+                            )
+                            total_mods = max(len(aggregate['mod_totals']), 1)
+                            done_mods = sum(1 for k in aggregate['mod_totals'] if aggregate['mod_bytes'].get(k, 0) >= aggregate['mod_totals'].get(k, 1))
+                            self.speed_eta_label.configure(text=f"模组进度: {done_mods}/{total_mods}")
+                        except Exception:
+                            pass
                     try:
-                        # 下载模组
-                        def download_callback(p, s=0, e=0):
-                            if not self.cancel_event.is_set():
-                                self.update_progress(p, s, e)
-                                
-                        success = ModUtils.download_mod(
-                            mod_id,
-                            local_path,
-                            progress_callback=download_callback,
-                            preferred_node=node,
-                            mod_list=selected_list  # 传递选择的模组列表
-                        )
-                        
-                        if success:
-                            # 使用完整的文件名
-                            remote_filename = remote_mods[mod_id].get('filename', f"{mod_name}_{mod_id}.7z")
-                            archive_path = os.path.join(local_path, remote_filename)
-                            
-                            # 确保模组文件夹名称与7Z文件名一致
-                            folder_name = os.path.splitext(remote_filename)[0]  # 移除.7z后缀
-                            target_folder = os.path.join(local_path, folder_name)
-                            
-                            # 处理文件夹冲突
-                            if os.path.exists(target_folder):
-                                logging.info(f"删除已存在的目标文件夹: {target_folder}")
-                                shutil.rmtree(target_folder)
-                            
-                            if ModUtils.extract_mod(archive_path, target_folder):
-                                # 清理下载的7z文件
-                                try:
-                                    os.remove(archive_path)
-                                    logging.info(f"清理下载文件: {archive_path}")
-                                except Exception as e:
-                                    logging.error(f"清理下载文件失败: {str(e)}")
-                                results[mod_id] = "成功"
-                            else:
-                                results[mod_id] = "解压失败"
-                        else:
-                            results[mod_id] = "下载失败"
-                            
-                    except Exception as e:
-                        results[mod_id] = f"处理失败: {str(e)}"
-                        
-                    # 更新树形视图
-                    self.update_tree_item(mod_id, results[mod_id])
-                    
+                        self.root.after(0, do_update)
+                    except Exception:
+                        do_update()
+                    return True
+
+                # 下载前预取所有目标文件大小用于总体进度
+                # 构建候选模组清单
+                all_targets = to_update + to_add
+                # 预取大小
+                try:
+                    size_map = ModUtils.prefetch_sizes(all_targets, selected_list)
+                except Exception:
+                    size_map = {}
+
+                # 初始化每项总大小到聚合器
+                for mid in all_targets:
+                    total_bytes = size_map.get(mid, 0)
+                    if total_bytes > 0:
+                        aggregate['mod_totals'][mid] = total_bytes
+
+                parallel_results = ModUtils.process_mods_parallel(
+                    local_path,
+                    to_update,
+                    to_add,
+                    local_mods,
+                    remote_mods,
+                    progress_callback=download_callback,
+                    pause_event=self.pause_event
+                )
+
+                # 汇总结果并更新 UI
+                for mod_id, status in parallel_results.items():
+                    results[mod_id] = status
+                    self.update_tree_item(mod_id, status)
+
             except Exception as e:
                 logging.error(f"处理模组失败: {str(e)}")
                 raise
@@ -679,21 +760,38 @@ class MainWindow:
             
     def get_mod_name(self, mod_id):
         """获取模组名称"""
-        for item in self.tree.get_children():
-            values = list(self.tree.item(item)['values'])
-            if values[0] == mod_id:
-                return values[0]  # 返回模组名称
-        return mod_id  # 如果找不到，返回模组ID
+        try:
+            values = list(self.tree.item(mod_id)['values'])
+            return values[0] if values else mod_id
+        except Exception:
+            return mod_id
 
     def update_tree_item(self, mod_id, status):
-        for item in self.tree.get_children():
-            values = list(self.tree.item(item)['values'])
-            if values[0] == mod_id:  # 使用模组名称匹配
-                values[3] = status  # 更新状态列
-                self.tree.item(item, values=values)
-                break
+        try:
+            values = list(self.tree.item(mod_id)['values'])
+            if values:
+                display_status = '已同步' if status == '成功' else status
+                values[3] = display_status
+                tags = ()
+                if isinstance(display_status, str):
+                    if display_status in ("解压失败", "下载失败") or display_status.startswith("失败") or display_status.endswith("失败"):
+                        tags = ('failed',)
+                    elif display_status == '已同步':
+                        tags = ('synced',)
+                self.tree.item(mod_id, values=values, tags=tags)
+        except Exception:
+            pass
                 
     def run(self):
+        # 绑定关闭窗口事件，执行清理
+        def on_close():
+            try:
+                self.cancel_event.set()
+                self.is_running = False
+                self.cleanup_all_tmp_files()
+            finally:
+                self.root.destroy()
+        self.root.protocol("WM_DELETE_WINDOW", on_close)
         self.root.mainloop()
 
     def update_node_list(self):
@@ -747,7 +845,10 @@ class MainWindow:
                 try:
                     latency, is_available = ModUtils.check_node_latency(
                         node_info['endpoint'],
-                        node_info['port']
+                        node_info['port'],
+                        samples=5,
+                        method='tcp',
+                        secure=bool(node_info.get('secure', False))
                     )
                     
                     node_name = node_info.get('name', node_id)
@@ -809,7 +910,7 @@ class MainWindow:
     def cleanup_all_tmp_files(self):
         local_path = self.local_path_var.get()
         for file in os.listdir(local_path):
-            if file.endswith('.7z.tmp'):
+            if file.endswith('.tmp'):
                 try:
                     os.remove(os.path.join(local_path, file))
                 except Exception as e:
@@ -881,8 +982,8 @@ class MainWindow:
             speed = float(self.speed_entry.get())
             if speed < 0:
                 speed = 0
-            elif speed > 200:
-                speed = 200
+            elif speed > 1000:
+                speed = 1000
             self.speed_var.set(speed)
             # 设置速度限制（转换为MB/s）
             ModUtils.set_speed_limit(speed / 8)  # 将Mbps转换为MB/s
