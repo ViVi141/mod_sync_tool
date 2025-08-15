@@ -15,12 +15,18 @@ import shutil
 class MainWindow:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("TASK军事模拟俱乐部武装突袭重铸者模组同步器 V3.0.0")
+        self.root.title("TASK军事模拟俱乐部武装突袭重铸者模组同步器 V3.1.0")
         self.root.geometry("1000x800")  # 减小窗口大小
         
         self.setup_logging()
+        self._load_user_prefs()
         self.setup_ui()
         self.is_running = True  # 添加is_running属性
+        # 启动时尝试清理残留临时文件
+        try:
+            self.cleanup_all_tmp_files()
+        except Exception:
+            pass
         
         # 检查版本更新
         ModUtils.initialize()
@@ -87,6 +93,7 @@ class MainWindow:
         self.modlist_combo = ttk.Combobox(modlist_frame, textvariable=self.modlist_var, state="readonly", width=40)
         self.update_modlist_options()  # 初始化模组列表选项
         self.modlist_combo.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=1)
+        self.modlist_combo.bind("<<ComboboxSelected>>", self.on_modlist_selected)
         
         # 本地模组路径选择
         path_frame = ttk.Frame(main_frame)
@@ -96,7 +103,8 @@ class MainWindow:
         ttk.Label(path_frame, text="本地模组路径:").grid(row=0, column=0, sticky=tk.W, padx=1)  # 进一步减小padx
         # 使用用户的文档目录
         default_path = os.path.join(os.path.expanduser("~"), "Documents", "My Games", "ArmaReforger", "addons")
-        self.local_path_var = tk.StringVar(value=default_path)
+        init_path = self._prefs.get('local_path') or default_path
+        self.local_path_var = tk.StringVar(value=init_path)
         ttk.Entry(path_frame, textvariable=self.local_path_var, width=40).grid(row=0, column=1, sticky=(tk.W, tk.E), padx=1)  # 减小宽度和padx
         ttk.Button(path_frame, text="浏览", command=self.browse_local_path).grid(row=0, column=2, padx=1)  # 进一步减小padx
         
@@ -106,10 +114,12 @@ class MainWindow:
         node_frame.columnconfigure(1, weight=1)
         
         ttk.Label(node_frame, text="下载节点:").grid(row=0, column=0, sticky=tk.W, padx=1)
-        self.node_var = tk.StringVar(value="自动选择")
+        init_node_display = self._prefs.get('node_display') or "自动选择"
+        self.node_var = tk.StringVar(value=init_node_display)
         self.node_combo = ttk.Combobox(node_frame, textvariable=self.node_var, state="readonly", width=12)
         self.update_node_list()  # 初始化节点列表
         self.node_combo.grid(row=0, column=1, sticky=tk.W, padx=1)
+        self.node_combo.bind("<<ComboboxSelected>>", self.on_node_selected)
         
         # 更新节点状态按钮
         ttk.Button(node_frame, text="更新节点状态", command=self.update_node_status).grid(row=0, column=2, padx=1)
@@ -126,7 +136,8 @@ class MainWindow:
         ttk.Label(speed_frame, text="下载速度限制:").grid(row=0, column=0, sticky=tk.W, padx=1)
         
         # 速度限制滑动条
-        self.speed_var = tk.DoubleVar(value=0)
+        init_speed = float(self._prefs.get('speed_mbps') or 0)
+        self.speed_var = tk.DoubleVar(value=init_speed)
         self.speed_scale = ttk.Scale(
             speed_frame,
             from_=0,
@@ -141,7 +152,7 @@ class MainWindow:
         # 速度限制输入框
         self.speed_entry = ttk.Entry(speed_frame, width=8)
         self.speed_entry.grid(row=0, column=2, padx=1)
-        self.speed_entry.insert(0, "0")
+        self.speed_entry.insert(0, f"{init_speed:.1f}")
         self.speed_entry.bind('<Return>', self.on_speed_entry_change)
         self.speed_entry.bind('<FocusOut>', self.on_speed_entry_change)
         
@@ -197,6 +208,12 @@ class MainWindow:
         
         # 初始化节点状态
         self.update_node_status()
+        # 恢复模组列表选择
+        try:
+            if self._prefs.get('mod_list') and self._prefs['mod_list'] in self.modlist_combo['values']:
+                self.modlist_var.set(self._prefs['mod_list'])
+        except Exception:
+            pass
 
     def create_mod_list(self, parent):
         # 创建模组列表框架
@@ -205,25 +222,32 @@ class MainWindow:
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
         
-        # 创建Treeview
-        columns = ('name', 'local_version', 'remote_version', 'status', 'progress', 'rate')
-        self.tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=25)  # 增加高度
+        # 创建Treeview（新增本地/云端大小列）
+        self.columns = (
+            'name', 'local_version', 'remote_version', 'local_size', 'remote_size', 'status', 'progress', 'rate'
+        )
+        self.tree = ttk.Treeview(list_frame, columns=self.columns, show='headings', height=25)
         
         # 设置列标题
-        self.tree.heading('name', text='模组名称', command=lambda: self.sort_treeview('name', False))
-        self.tree.heading('local_version', text='本地版本', command=lambda: self.sort_treeview('local_version', False))
-        self.tree.heading('remote_version', text='云端版本', command=lambda: self.sort_treeview('remote_version', False))
-        self.tree.heading('status', text='状态', command=lambda: self.sort_treeview('status', False))
-        self.tree.heading('progress', text='进度', command=lambda: self.sort_treeview('progress', False))
-        self.tree.heading('rate', text='速度/剩余', command=lambda: self.sort_treeview('rate', False))
+        self._current_sort = {'col': None, 'reverse': False}
+        self.tree.heading('name', text='模组名称', command=lambda: self._on_header_click('name'))
+        self.tree.heading('local_version', text='本地版本', command=lambda: self._on_header_click('local_version'))
+        self.tree.heading('remote_version', text='云端版本', command=lambda: self._on_header_click('remote_version'))
+        self.tree.heading('local_size', text='本地大小', command=lambda: self._on_header_click('local_size'))
+        self.tree.heading('remote_size', text='云端大小', command=lambda: self._on_header_click('remote_size'))
+        self.tree.heading('status', text='状态', command=lambda: self._on_header_click('status'))
+        self.tree.heading('progress', text='进度', command=lambda: self._on_header_click('progress'))
+        self.tree.heading('rate', text='速度/剩余', command=lambda: self._on_header_click('rate'))
         
         # 设置列宽
-        self.tree.column('name', width=250)  # 减小宽度
-        self.tree.column('local_version', width=80)  # 减小宽度
-        self.tree.column('remote_version', width=80)  # 减小宽度
-        self.tree.column('status', width=100)  # 减小宽度
+        self.tree.column('name', width=240)
+        self.tree.column('local_version', width=80)
+        self.tree.column('remote_version', width=80)
+        self.tree.column('local_size', width=90)
+        self.tree.column('remote_size', width=90)
+        self.tree.column('status', width=90)
         self.tree.column('progress', width=80)
-        self.tree.column('rate', width=180)
+        self.tree.column('rate', width=170)
         
         # 添加滚动条
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
@@ -255,6 +279,12 @@ class MainWindow:
         self.context_menu.add_command(label="打开日志目录", command=self.open_log_folder)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="反向排序", command=self.reverse_sort)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="仅看需更新/未安装", command=self.filter_to_changes)
+        self.context_menu.add_command(label="仅看失败项", command=self.filter_to_failed)
+        self.context_menu.add_command(label="清除筛选", command=self.clear_filters)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="仅重试失败项", command=self.retry_failed_only)
         
         # 绑定右键菜单
         self.tree.bind("<Button-3>", self.show_context_menu)
@@ -262,6 +292,80 @@ class MainWindow:
     def show_context_menu(self, event):
         """显示右键菜单"""
         self.context_menu.post(event.x_root, event.y_root)
+
+    def _iter_all_rows(self):
+        for iid in self.tree.get_children(''):
+            yield iid, list(self.tree.item(iid).get('values', []))
+
+    def filter_to_changes(self):
+        try:
+            # 记录当前所有行以便清除筛选时恢复
+            self._all_iids = list(self.tree.get_children(''))
+            for iid, values in self._iter_all_rows():
+                status = values[3] if len(values) > 3 else ''
+                if status not in ('需要更新', '未安装'):
+                    self.tree.detach(iid)
+        except Exception:
+            pass
+
+    def filter_to_failed(self):
+        try:
+            self._all_iids = list(self.tree.get_children(''))
+            for iid, values in self._iter_all_rows():
+                status = values[3] if len(values) > 3 else ''
+                if not (isinstance(status, str) and ('失败' in status)):
+                    self.tree.detach(iid)
+        except Exception:
+            pass
+
+    def clear_filters(self):
+        try:
+            to_restore = getattr(self, '_all_iids', None)
+            if not to_restore:
+                to_restore = []
+            # 先将当前已显示的保留，恢复被分离的项
+            current = set(self.tree.get_children(''))
+            for iid in to_restore:
+                if iid not in current:
+                    self.tree.reattach(iid, '', 'end')
+        except Exception:
+            pass
+
+    def retry_failed_only(self):
+        try:
+            local_mods = {}
+            for iid, values in self._iter_all_rows():
+                status = values[3] if len(values) > 3 else ''
+                if isinstance(status, str) and ('失败' in status):
+                    # values: name, local_version, remote_version, status, progress, rate
+                    name = values[0] if len(values) > 0 else iid
+                    local_mods[iid] = {'name': name, 'version': values[1] if len(values) > 1 else ''}
+            if not local_mods:
+                messagebox.showinfo("提示", "没有失败的模组可重试")
+                return
+
+            # 构造 to_update/to_add
+            remote_mods = ModUtils.get_remote_mods(self.modlist_var.get())
+            to_update, to_add = [], []
+            for mid in local_mods.keys():
+                if mid in remote_mods and local_mods[mid].get('version') != remote_mods[mid].get('version'):
+                    to_update.append(mid)
+                elif mid in remote_mods:
+                    to_update.append(mid)
+                else:
+                    # 若远端无此ID，跳过
+                    pass
+
+            self.process_mods(
+                self.local_path_var.get(),
+                to_update,
+                to_add,
+                local_mods,
+                remote_mods,
+                self.get_selected_node()
+            )
+        except Exception as e:
+            self.log_message(f"仅重试失败项失败: {str(e)}", logging.ERROR)
 
     def open_log_folder(self):
         try:
@@ -328,6 +432,19 @@ class MainWindow:
                     return (0, float(value.strip('% ')))
                 except Exception:
                     return (1, 0.0)
+            elif col in ['local_size', 'remote_size']:
+                # 大小排序，值如 '12.3MB'
+                try:
+                    unit_map = {'B':1, 'KB':1024, 'MB':1024**2, 'GB':1024**3, 'TB':1024**4}
+                    s = value.strip()
+                    if not s:
+                        return (1, 0)
+                    num = float(''.join(ch for ch in s if (ch.isdigit() or ch=='.')))
+                    unit = ''.join(ch for ch in s if ch.isalpha()).upper()
+                    mul = unit_map.get(unit, 1)
+                    return (0, num*mul)
+                except Exception:
+                    return (1, 0)
             else:
                 # 其他列按字符串排序
                 return (0, value.lower())
@@ -339,24 +456,52 @@ class MainWindow:
         for index, (_, item) in enumerate(items):
             self.tree.move(item, '', index)
             
-        # 切换排序方向
+        # 更新表头箭头
+        try:
+            for c in ['name', 'local_version', 'remote_version', 'local_size', 'remote_size', 'status', 'progress', 'rate']:
+                base = {
+                    'name': '模组名称',
+                    'local_version': '本地版本',
+                    'remote_version': '云端版本',
+                    'local_size': '本地大小',
+                    'remote_size': '云端大小',
+                    'status': '状态',
+                    'progress': '进度',
+                    'rate': '速度/剩余',
+                }[c]
+                if c == col:
+                    arrow = ' ↓' if not reverse else ' ↑'
+                    self.tree.heading(c, text=base + arrow)
+                else:
+                    self.tree.heading(c, text=base)
+        except Exception:
+            pass
+        # 记录当前排序
+        self._current_sort = {'col': col, 'reverse': reverse}
+
+        # 切换排序方向回调
         self.tree.heading(col, command=lambda: self.sort_treeview(col, not reverse))
         
     def reverse_sort(self):
         """反向排序当前列"""
-        # 获取当前排序的列
-        for col in ['name', 'local_version', 'remote_version', 'status']:
-            if self.tree.heading(col)['text'].endswith(' ↓'):
-                self.sort_treeview(col, True)
-                break
-            elif self.tree.heading(col)['text'].endswith(' ↑'):
-                self.sort_treeview(col, False)
-                break
+        col = self._current_sort.get('col')
+        if col:
+            self.sort_treeview(col, not self._current_sort.get('reverse', False))
+
+    def _on_header_click(self, col):
+        cur = self._current_sort.get('col')
+        reverse = self._current_sort.get('reverse', False)
+        if cur == col:
+            self.sort_treeview(col, not reverse)
+        else:
+            self.sort_treeview(col, False)
         
     def browse_local_path(self):
         path = filedialog.askdirectory()
         if path:
             self.local_path_var.set(path)
+            self._prefs['local_path'] = path
+            self._save_user_prefs()
             
     def create_log_view(self, parent):
         """创建日志显示界面"""
@@ -438,26 +583,57 @@ class MainWindow:
             self.progress_var.set(50)
             to_update, to_add, to_remove = ModUtils.compare_mods(local_mods, remote_mods)
             
+            # 预取云端大小
+            try:
+                remote_size_map = ModUtils.prefetch_sizes(list(remote_mods.keys()), selected_list)
+            except Exception:
+                remote_size_map = {}
+
             # 更新列表
+            def fmt_size(sz):
+                try:
+                    sz = int(sz)
+                except Exception:
+                    return ''
+                units = ['B','KB','MB','GB','TB']
+                i = 0
+                v = float(sz)
+                while v >= 1024 and i < len(units)-1:
+                    v /= 1024.0
+                    i += 1
+                return f"{v:.1f}{units[i]}" if sz > 0 else ''
+
             for mod_id, info in local_mods.items():
                 remote_info = remote_mods.get(mod_id, {})
                 remote_version = remote_info.get('version', 'unknown')
                 status = ModUtils.compare_versions(info['version'], remote_version)
+                local_size = fmt_size(info.get('size', 0))
+                remote_size = fmt_size(remote_size_map.get(mod_id, 0))
                 self.tree.insert('', 'end', iid=mod_id, values=(
                     info['name'],
                     info['version'],
                     remote_version,
-                    status
+                    local_size,
+                    remote_size,
+                    status,
+                    '',
+                    ''
                 ))
                 
             for mod_id in to_add:
                 info = remote_mods[mod_id]
                 status = ModUtils.compare_versions('', info['version'])
+                local_size = ''
+                remote_size = fmt_size(remote_size_map.get(mod_id, 0))
                 self.tree.insert('', 'end', iid=mod_id, values=(
                     info['name'],
                     '未安装',
                     info['version'],
-                    status
+                    local_size,
+                    remote_size,
+                    status,
+                    '',
+                    ''
                 ))
                 
             # 显示检查结果
@@ -562,6 +738,8 @@ class MainWindow:
                     return
                     
                 # 处理模组
+                # 进入下载/解压阶段
+                self.status_var.set("准备下载...")
                 results = self.process_mods(
                     self.local_path_var.get(),
                     to_update,
@@ -618,14 +796,15 @@ class MainWindow:
                 last_ui_update = {'t': 0.0}
                 MIN_UPDATE_INTERVAL = 0.2  # 秒，限流UI刷新，避免闪烁
 
-                def download_callback(mid, p, s=0, e=0, cur_bytes=0, total_bytes=0):
+                def download_callback(mid, p, s=0, e=0, cur_bytes=0, total_bytes=0, phase='download'):
                     if self.cancel_event.is_set():
                         return False
                     # 更新分项数据
-                    if total_bytes and total_bytes > 0:
-                        aggregate['mod_totals'][mid] = total_bytes
-                    aggregate['mod_bytes'][mid] = max(cur_bytes, aggregate['mod_bytes'].get(mid, 0))
-                    aggregate['speeds'][mid] = s
+                    if phase == 'download':
+                        if total_bytes and total_bytes > 0:
+                            aggregate['mod_totals'][mid] = total_bytes
+                        aggregate['mod_bytes'][mid] = max(cur_bytes, aggregate['mod_bytes'].get(mid, 0))
+                        aggregate['speeds'][mid] = s
                     # 更新表格该行的“进度/速度/ETA”
                     try:
                         item = mid
@@ -635,10 +814,16 @@ class MainWindow:
                             # 确保列索引存在：name, local_version, remote_version, status, progress, rate
                             while len(values) < 6:
                                 values.append("")
-                            values[4] = f"{p:.1f}%"
-                            speed_text = f"{s/1024/1024:.1f} MB/s"
-                            eta_text = f"{e/60:.1f} 分钟" if e > 0 else "计算中..."
-                            values[5] = f"{speed_text} / {eta_text}"
+                            if phase == 'download':
+                                values[3] = '下载中...'
+                                values[4] = f"{p:.1f}%"
+                                speed_text = f"{s/1024/1024:.1f} MB/s"
+                                eta_text = f"{e/60:.1f} 分钟" if e > 0 else "计算中..."
+                                values[5] = f"{speed_text} / {eta_text}"
+                            else:
+                                values[3] = '解压中...'
+                                values[4] = f"{p:.1f}%"
+                                values[5] = ""
                             self.tree.item(item, values=values)
                     except Exception:
                         pass
@@ -674,16 +859,19 @@ class MainWindow:
 
                     def do_update():
                         try:
-                            # 总进度取聚合值，但不将“下载完成但未解压”的任务当作完全完成；此处仅显示下载层面的聚合
-                            self.progress_var.set(overall_progress)
-                            overall_speed_text = f"{combined_speed/1024/1024:.1f} MB/s"
-                            overall_eta_text = f"{overall_eta/60:.1f} 分钟" if overall_eta > 0 else "计算中..."
-                            current_speed_text = f"{s/1024/1024:.1f} MB/s"
-                            current_eta_text = f"{e/60:.1f} 分钟" if e > 0 else "计算中..."
-                            self.status_var.set(
-                                f"总体 {overall_progress:.1f}% ({overall_speed_text}, 剩余 {overall_eta_text}) | "
-                                f"当前 {mid}: {p:.1f}% ({current_speed_text}, 剩余 {current_eta_text})"
-                            )
+                            # 进度显示：下载阶段用聚合；解压阶段按事件文字
+                            if phase == 'download':
+                                self.progress_var.set(overall_progress)
+                                overall_speed_text = f"{combined_speed/1024/1024:.1f} MB/s"
+                                overall_eta_text = f"{overall_eta/60:.1f} 分钟" if overall_eta > 0 else "计算中..."
+                                current_speed_text = f"{s/1024/1024:.1f} MB/s"
+                                current_eta_text = f"{e/60:.1f} 分钟" if e > 0 else "计算中..."
+                                self.status_var.set(
+                                    f"总体下载 {overall_progress:.1f}% ({overall_speed_text}, 剩余 {overall_eta_text}) | "
+                                    f"当前 {mid}: {p:.1f}% ({current_speed_text}, 剩余 {current_eta_text})"
+                                )
+                            else:
+                                self.status_var.set(f"解压中: {mid} {p:.1f}%")
                             total_mods = max(len(aggregate['mod_totals']), 1)
                             done_mods = sum(1 for k in aggregate['mod_totals'] if aggregate['mod_bytes'].get(k, 0) >= aggregate['mod_totals'].get(k, 1))
                             self.speed_eta_label.configure(text=f"模组进度: {done_mods}/{total_mods}")
@@ -710,6 +898,8 @@ class MainWindow:
                     if total_bytes > 0:
                         aggregate['mod_totals'][mid] = total_bytes
 
+                # 下载阶段
+                self.status_var.set("下载中...")
                 parallel_results = ModUtils.process_mods_parallel(
                     local_path,
                     to_update,
@@ -717,8 +907,11 @@ class MainWindow:
                     local_mods,
                     remote_mods,
                     progress_callback=download_callback,
-                    pause_event=self.pause_event
+                    pause_event=self.pause_event,
+                    preferred_node=preferred_node,
+                    mod_list=selected_list
                 )
+                # 解压状态在 ModUtils 内部进行；此处将状态置为“解压中/完成”由回调推进
 
                 # 汇总结果并更新 UI
                 for mod_id, status in parallel_results.items():
@@ -806,12 +999,15 @@ class MainWindow:
             
             # 构建节点选项
             node_options = ["自动选择"]
+            self._node_display_to_id = {"自动选择": None}
             for node_id in available_nodes:
                 node_info = ModUtils.get_node_info(node_id)
                 if node_info:
                     try:
                         node_name = node_info.get('name', node_id)
-                        node_options.append(f"{node_name}节点")
+                        display = f"{node_name} ({node_id})"
+                        node_options.append(display)
+                        self._node_display_to_id[display] = node_id
                     except Exception as e:
                         logging.error(f"处理节点 {node_id} 名称失败: {str(e)}")
                         continue
@@ -820,8 +1016,12 @@ class MainWindow:
             self.node_combo['values'] = node_options
             
             # 如果当前选择不在新列表中，重置为自动选择
-            if self.node_var.get() not in node_options:
+            cur = self.node_var.get()
+            if cur not in node_options:
                 self.node_var.set("自动选择")
+            # 保存映射与当前显示
+            self._prefs['node_display'] = self.node_var.get()
+            self._save_user_prefs()
                 
         except Exception as e:
             logging.error(f"更新节点列表失败: {str(e)}")
@@ -878,20 +1078,9 @@ class MainWindow:
             selected = self.node_var.get()
             if not selected or selected == "自动选择":
                 return None
-                
-            # 从显示名称中提取节点ID
-            selected_name = selected.replace("节点", "")  # 移除"节点"后缀
-            for node_id in ModUtils.get_available_nodes():
-                node_info = ModUtils.get_node_info(node_id)
-                if node_info:
-                    try:
-                        node_name = node_info.get('name', node_id)
-                        if node_name == selected_name:
-                            return node_id
-                    except Exception as e:
-                        logging.error(f"处理节点 {node_id} 名称失败: {str(e)}")
-                        continue
-                        
+            # 通过映射解析显示文本
+            if hasattr(self, '_node_display_to_id') and selected in self._node_display_to_id:
+                return self._node_display_to_id[selected]
             return None
         except Exception as e:
             logging.error(f"获取选择的节点失败: {str(e)}")
@@ -909,12 +1098,17 @@ class MainWindow:
 
     def cleanup_all_tmp_files(self):
         local_path = self.local_path_var.get()
-        for file in os.listdir(local_path):
-            if file.endswith('.tmp'):
-                try:
-                    os.remove(os.path.join(local_path, file))
-                except Exception as e:
-                    self.log_message(f"清理缓存文件失败: {file} {str(e)}", logging.WARNING)
+        try:
+            if not local_path or not os.path.isdir(local_path):
+                return
+            for file in os.listdir(local_path):
+                if file.endswith('.tmp'):
+                    try:
+                        os.remove(os.path.join(local_path, file))
+                    except Exception as e:
+                        self.log_message(f"清理缓存文件失败: {file} {str(e)}", logging.WARNING)
+        except Exception:
+            pass
 
     def update_progress(self, progress, speed=0, eta=0):
         """更新进度条和状态"""
@@ -952,7 +1146,14 @@ class MainWindow:
             self.modlist_combo['values'] = list(modlists.keys())
             # 默认选择第一个选项
             if self.modlist_combo['values']:
-                self.modlist_var.set(self.modlist_combo['values'][0])
+                if not self.modlist_var.get():
+                    self.modlist_var.set(self.modlist_combo['values'][0])
+                # 恢复并保存选择
+                try:
+                    if self._prefs.get('mod_list') in self.modlist_combo['values']:
+                        self.modlist_var.set(self._prefs.get('mod_list'))
+                except Exception:
+                    pass
         else:
             self.modlist_combo['values'] = []
             self.modlist_var.set("")
@@ -965,6 +1166,24 @@ class MainWindow:
             self.speed_entry.insert(0, f"{speed:.1f}")
         except ValueError:
             pass
+
+    def on_modlist_selected(self, event=None):
+        try:
+            sel = self.modlist_var.get()
+            if sel:
+                self._prefs['mod_list'] = sel
+                self._save_user_prefs()
+        except Exception:
+            pass
+
+    def on_node_selected(self, event=None):
+        try:
+            sel = self.node_var.get()
+            if sel:
+                self._prefs['node_display'] = sel
+                self._save_user_prefs()
+        except Exception:
+            pass
             
     def on_speed_change_final(self, event=None):
         """当用户释放滑动条时应用速度设置"""
@@ -973,6 +1192,8 @@ class MainWindow:
             # 设置速度限制（转换为MB/s）
             ModUtils.set_speed_limit(speed / 8)  # 将Mbps转换为MB/s
             self.log_message(f"下载速度限制已设置为 {speed:.1f} Mbps")
+            self._prefs['speed_mbps'] = speed
+            self._save_user_prefs()
         except ValueError:
             pass
 
@@ -988,10 +1209,38 @@ class MainWindow:
             # 设置速度限制（转换为MB/s）
             ModUtils.set_speed_limit(speed / 8)  # 将Mbps转换为MB/s
             self.log_message(f"下载速度限制已设置为 {speed:.1f} Mbps")
+            self._prefs['speed_mbps'] = speed
+            self._save_user_prefs()
         except ValueError:
             # 如果输入无效，恢复滑动条的值
             self.speed_entry.delete(0, tk.END)
             self.speed_entry.insert(0, f"{self.speed_var.get():.1f}")
+
+    def _prefs_path(self):
+        base = os.path.join(os.path.expanduser("~"), "Documents", "mod_sync_tool")
+        try:
+            os.makedirs(base, exist_ok=True)
+        except Exception:
+            pass
+        return os.path.join(base, "user_prefs.json")
+
+    def _load_user_prefs(self):
+        self._prefs = {}
+        try:
+            path = self._prefs_path()
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    self._prefs = json.load(f) or {}
+        except Exception:
+            self._prefs = {}
+
+    def _save_user_prefs(self):
+        try:
+            path = self._prefs_path()
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(self._prefs, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
 class LogHandler(logging.Handler):
     """自定义日志处理器，用于在GUI中显示日志"""

@@ -17,28 +17,28 @@ from botocore.client import Config
 from botocore.exceptions import ClientError
 import boto3
 import random
+from boto3.s3.transfer import S3Transfer, TransferConfig
 
 class SensitiveFilter(logging.Filter):
     """日志过滤器，用于过滤敏感信息"""
     def __init__(self):
         super().__init__()
-        # 需要过滤的敏感信息模式
-        self.sensitive_patterns = [
-            r'access_key\s*=\s*["\']([^"\']+)["\']',
-            r'secret_key\s*=\s*["\']([^"\']+)["\']',
-            r'password\s*=\s*["\']([^"\']+)["\']',
-            r'token\s*=\s*["\']([^"\']+)["\']',
-            r'key\s*=\s*["\']([^"\']+)["\']',
-            r'credential\s*=\s*["\']([^"\']+)["\']',
-        ]
+        # 需要过滤的敏感信息模式（捕获键与值，整体替换为 key=[REDACTED]）
         import re
-        self.patterns = [re.compile(pattern) for pattern in self.sensitive_patterns]
+        self.patterns = [
+            (re.compile(r'(access_key)\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE), 'access_key'),
+            (re.compile(r'(secret_key)\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE), 'secret_key'),
+            (re.compile(r'(password)\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE), 'password'),
+            (re.compile(r'(token)\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE), 'token'),
+            (re.compile(r'(credential)\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE), 'credential'),
+        ]
 
     def filter(self, record):
         if isinstance(record.msg, str):
-            # 替换敏感信息为 [REDACTED]
-            for pattern in self.patterns:
-                record.msg = pattern.sub(r'\1=[REDACTED]', record.msg)
+            msg = record.msg
+            for regex, key in self.patterns:
+                msg = regex.sub(f"{key}=[REDACTED]", msg)
+            record.msg = msg
         return True
 
 # 配置日志过滤器：同时作用于专用 logger 与根 logger，避免敏感信息外泄
@@ -48,8 +48,8 @@ logging.getLogger().addFilter(SensitiveFilter())
 
 class ModUtils:
     # 版本信息
-    VERSION = "3.0.0"  # 当前版本
-    MIN_VERSION = "3.0.0"  # 最低支持版本
+    VERSION = "3.1.0"  # 当前版本
+    MIN_VERSION = "3.1.0"  # 最低支持版本
     VERSION_CHECK_URL = "https://www.vivi141.com/version.json"  # 版本检查URL
     VERSION_CACHE_FILE = ".version_cache.json"
     
@@ -131,13 +131,15 @@ class ModUtils:
     # 下载锁
     download_lock = threading.Lock()
 
-    # 下载速度限制（字节/秒）
-    DOWNLOAD_SPEED_LIMIT = 0  # 0表示不限制
-    # 下载速度限制窗口（秒）
-    SPEED_LIMIT_WINDOW = 1.0
-    # 下载速度限制缓冲区
-    _speed_limit_buffer = []
-    _speed_limit_lock = threading.Lock()
+    # 令牌桶限速（全局 + 每线程）
+    DOWNLOAD_SPEED_LIMIT = 0  # 全局上限（字节/秒），0 表示不限制
+    _global_bucket = {
+        'capacity': 0,
+        'tokens': 0.0,
+        'last_refill': time.time(),
+    }
+    _per_thread_buckets: Dict[int, dict] = {}
+    _bucket_lock = threading.Lock()
 
     @classmethod
     def initialize(cls):
@@ -339,7 +341,8 @@ class ModUtils:
                                 mods[mod_id] = {
                                     'name': folder,
                                     'version': version,
-                                    'path': folder_path
+                                    'path': folder_path,
+                                    'size': ModUtils.get_folder_size_safe(folder_path)
                                 }
                     except PermissionError:
                         logging.error(f"无法读取文件: {server_data_path}")
@@ -347,6 +350,20 @@ class ModUtils:
                     except Exception:
                         continue
         return mods
+
+    @staticmethod
+    def get_folder_size_safe(path: str) -> int:
+        try:
+            total = 0
+            for root, dirs, files in os.walk(path):
+                for fn in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, fn))
+                    except Exception:
+                        continue
+            return total
+        except Exception:
+            return 0
 
     @staticmethod
     def get_minio_config_from_web() -> dict:
@@ -572,6 +589,8 @@ class ModUtils:
                         info['filename'] = f"{info['name']}_{mod_id}.7z"
                     if 'path' not in info:
                         info['path'] = info['filename']
+                    if 'size' not in info:
+                        info['size'] = 0
                 return mods
             except Exception as e:
                 logging.warning(f"HTTP获取mod_info.json失败，尝试R2直连获取: {str(e)}")
@@ -608,6 +627,8 @@ class ModUtils:
                             info['filename'] = f"{info['name']}_{mod_id}.7z"
                         if 'path' not in info:
                             info['path'] = info['filename']
+                        if 'size' not in info:
+                            info['size'] = 0
                     return mods
                     
             except Exception as e:
@@ -963,38 +984,63 @@ class ModUtils:
         if speed_mbps <= 0:
             ModUtils.DOWNLOAD_SPEED_LIMIT = 0
         else:
-            # 将MB/s转换为字节/秒
             ModUtils.DOWNLOAD_SPEED_LIMIT = int(speed_mbps * 1024 * 1024)
+        # 重置桶
+        with ModUtils._bucket_lock:
+            cap = ModUtils.DOWNLOAD_SPEED_LIMIT
+            ModUtils._global_bucket = {
+                'capacity': cap,
+                'tokens': float(cap),
+                'last_refill': time.time(),
+            }
+            ModUtils._per_thread_buckets.clear()
         ModUtils.logger.info(f"设置下载速度限制: {speed_mbps}MB/s")
 
     @staticmethod
     def _limit_speed(data_size: int):
-        """限制下载速度
-        Args:
-            data_size: 数据大小（字节）
-        """
-        if ModUtils.DOWNLOAD_SPEED_LIMIT <= 0:
+        """令牌桶限速：消耗全局与当前线程桶令牌，不足则按需睡眠。"""
+        if ModUtils.DOWNLOAD_SPEED_LIMIT <= 0 or data_size <= 0:
             return
+        tid = threading.get_ident()
+        now = time.time()
+        with ModUtils._bucket_lock:
+            # 全局桶补充
+            g = ModUtils._global_bucket
+            cap = float(ModUtils.DOWNLOAD_SPEED_LIMIT)
+            if cap <= 0:
+                return
+            elapsed = max(0.0, now - g.get('last_refill', now))
+            g['tokens'] = min(cap, g.get('tokens', 0.0) + elapsed * cap)
+            g['last_refill'] = now
 
-        current_time = time.time()
-        with ModUtils._speed_limit_lock:
-            # 清理过期的速度记录
-            ModUtils._speed_limit_buffer = [
-                (t, size) for t, size in ModUtils._speed_limit_buffer
-                if current_time - t < ModUtils.SPEED_LIMIT_WINDOW
-            ]
-            
-            # 添加新的速度记录
-            ModUtils._speed_limit_buffer.append((current_time, data_size))
-            
-            # 计算当前窗口内的总数据量
-            total_size = sum(size for _, size in ModUtils._speed_limit_buffer)
-            
-            # 如果超过速度限制，计算需要等待的时间
-            if total_size > ModUtils.DOWNLOAD_SPEED_LIMIT * ModUtils.SPEED_LIMIT_WINDOW:
-                sleep_time = (total_size / ModUtils.DOWNLOAD_SPEED_LIMIT) - ModUtils.SPEED_LIMIT_WINDOW
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+            # 线程桶
+            b = ModUtils._per_thread_buckets.get(tid)
+            if not b:
+                # 分配线程桶容量为全局的 1/N（N 近似设为 8），避免单线程抢占
+                tcap = cap / 8.0
+                b = {'capacity': tcap, 'tokens': tcap, 'last_refill': now}
+                ModUtils._per_thread_buckets[tid] = b
+            else:
+                telapsed = max(0.0, now - b.get('last_refill', now))
+                b['tokens'] = min(b['capacity'], b.get('tokens', 0.0) + telapsed * b['capacity'])
+                b['last_refill'] = now
+
+            need = float(data_size)
+            # 尝试消耗
+            g_avail = g['tokens']
+            t_avail = b['tokens']
+            take = min(need, g_avail, t_avail)
+            g['tokens'] -= take
+            b['tokens'] -= take
+            remain = need - take
+
+        if remain > 0:
+            # 计算时间：按更紧的桶来估算等待
+            g_rate = float(ModUtils.DOWNLOAD_SPEED_LIMIT)
+            t_rate = float(ModUtils.DOWNLOAD_SPEED_LIMIT) / 8.0
+            rate = min(g_rate, t_rate)
+            if rate > 0:
+                time.sleep(remain / rate)
 
     @staticmethod
     def download_mod(
@@ -1112,7 +1158,7 @@ class ModUtils:
 
                 # 覆盖重试等待时间
                 try:
-                    current_retry_delay = int(settings.get('retry_delay', current_retry_delay))
+                    current_retry_delay = int(settings.get('retry_delay', default_retry_delay))
                 except Exception:
                     current_retry_delay = default_retry_delay
 
@@ -1304,7 +1350,7 @@ class ModUtils:
                                         progress = (current_size / file_size) * 100
                                         if progress_callback:
                                             try:
-                                                ret = progress_callback(mod_id, progress, speed, eta, current_size, file_size)
+                                                ret = progress_callback(mod_id, progress, speed, eta, current_size, file_size, 'download')
                                                 if ret is False:
                                                     cancel_flag['cancelled'] = True
                                                     break
@@ -1322,98 +1368,126 @@ class ModUtils:
                 
                 try:
                     if not http_mode:
-                        # S3 续传：若存在本地部分，使用 Range 续传
-                        try:
-                            if local_size > 0 and file_size and local_size < file_size:
-                                response = client.get_object(Bucket=bucket, Key=real_key, Range=f'bytes={local_size}-')
-                                mode = 'ab'
-                            else:
-                                response = client.get_object(Bucket=bucket, Key=real_key)
-                                mode = 'wb'
-                            with open(temp_file, mode) as f:
-                                data = response['Body']
-                                for chunk in data.iter_chunks(chunk_size=1024*1024):  # 1MB chunks for better throughput
-                                    if pause_event is not None and not pause_event.is_set():
-                                        while pause_event is not None and not pause_event.is_set():
-                                            if cancel_flag['cancelled']:
-                                                raise Exception("同步被用户取消")
-                                            time.sleep(0.1)
-                                    if cancel_flag['cancelled']:
-                                        raise Exception("同步被用户取消")
-                                    if not chunk:
-                                        continue
-                                    ModUtils._limit_speed(len(chunk))
-                                    f.write(chunk)
-                        finally:
-                            if 'response' in locals():
+                        # 优先使用 S3 并发多段下载（最快）。若存在部分临时文件则重新下载以避免复杂续传问题。
+                        if os.path.exists(temp_file):
+                            try:
+                                os.remove(temp_file)
+                            except Exception:
+                                pass
+                        # 进度计算器
+                        class _S3CB:
+                            def __init__(self, total):
+                                self.total = float(total or 0)
+                                self.done = 0
+                                self.last_t = time.time()
+                                self.last_b = 0
+                            def __call__(self, bytes_amount):
                                 try:
-                                    data.close()
+                                    self.done += int(bytes_amount or 0)
+                                    now = time.time()
+                                    dt = max(1e-3, now - self.last_t)
+                                    ds = max(0, self.done - self.last_b)
+                                    speed = ds / dt
+                                    self.last_t = now
+                                    self.last_b = self.done
+                                    p = (self.done / self.total * 100.0) if self.total > 0 else 0.0
+                                    if progress_callback:
+                                        progress_callback(mod_id, p, speed, 0, self.done, self.total, 'download')
                                 except Exception:
                                     pass
+                        cfg = ModUtils.get_minio_settings() or {}
+                        # 进行一次小样本测速以自适应参数
+                        try:
+                            sample = min(int(cfg.get('tune_sample_bytes', 8 * 1024 * 1024)), int(file_size or 8 * 1024 * 1024))
+                            s3_bps = ModUtils._measure_s3_speed(client, bucket, real_key, sample, pause_event)
+                        except Exception:
+                            s3_bps = 0
+                        concurrency, chunk_size = ModUtils._choose_parallel_params(s3_bps, cfg, mode='s3')
+                        transfer = S3Transfer(client, TransferConfig(
+                            multipart_threshold=16 * 1024 * 1024,
+                            multipart_chunksize=chunk_size,
+                            max_concurrency=concurrency,
+                            use_threads=True,
+                        ))
+                        cb = _S3CB(file_size or 0)
+                        transfer.download_file(bucket, real_key, temp_file, callback=cb)
                     else:
-                        # 使用 HTTP(S) 直连（支持 Range 断点续传）
+                        # HTTP 并发分段下载：若已有部分临时文件，则退回到顺序续传（保留断点续传能力）。
                         http_timeout = max(5, int(settings.get('timeout', ModUtils.CONFIG_SERVER['timeout'])))
-                        headers = ModUtils.build_headers('*/*', {'Connection': 'keep-alive'})
-                        # 如果本地已有部分内容，尝试使用 Range 续传
-                        mode = 'wb'
-                        if local_size > 0:
-                            headers['Range'] = f'bytes={local_size}-'
-                            mode = 'ab'
                         if not url:
-                            # 兜底构造 URL（不包含 include_bucket 变化，仅用于已知 public_url_base 的场景）
                             base = node_info.get('public_url_base')
                             include_bucket = bool(node_info.get('bucket_in_path', True))
                             if include_bucket:
                                 url = f"{base.rstrip('/')}/{bucket}/{real_key}"
                             else:
                                 url = f"{base.rstrip('/')}/{real_key}"
-                        # 使用 Session 复用连接，并在任务结束后主动关闭，避免污染后续任务
-                        import requests as _rq
-                        from requests.adapters import HTTPAdapter
-                        _session = _rq.Session()
-                        try:
-                            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
-                            _session.mount('http://', adapter)
-                            _session.mount('https://', adapter)
-                        except Exception:
-                            pass
-                        _resp = None
-                        try:
-                            _resp = _session.get(url, timeout=http_timeout, headers=headers, stream=True, allow_redirects=True)
-                            _resp.raise_for_status()
-                            # 较大分块以提升吞吐
-                            chunk_size = 512 * 1024
-                            with open(temp_file, mode) as f:
-                                for chunk in _resp.iter_content(chunk_size=chunk_size):
-                                    if pause_event is not None and not pause_event.is_set():
-                                        while pause_event is not None and not pause_event.is_set():
-                                            if cancel_flag['cancelled']:
-                                                raise Exception("同步被用户取消")
-                                            time.sleep(0.1)
-                                    if cancel_flag['cancelled']:
-                                        raise Exception("同步被用户取消")
-                                    if not chunk:
-                                        continue
-                                    ModUtils._limit_speed(len(chunk))
-                                    f.write(chunk)
-                        finally:
+                        # 选择模式
+                        if local_size > 0 and file_size and local_size < file_size:
+                            # 顺序续传回退
+                            import requests as _rq
+                            from requests.adapters import HTTPAdapter
+                            headers = ModUtils.build_headers('*/*', {'Connection': 'keep-alive'})
+                            headers['Range'] = f'bytes={local_size}-'
+                            _session = _rq.Session()
                             try:
-                                if _resp is not None:
-                                    _resp.close()
+                                adapter = HTTPAdapter(pool_connections=8, pool_maxsize=16, max_retries=0)
+                                _session.mount('http://', adapter)
+                                _session.mount('https://', adapter)
                             except Exception:
                                 pass
+                            _resp = None
                             try:
-                                _session.close()
+                                _resp = _session.get(url, timeout=http_timeout, headers=headers, stream=True, allow_redirects=True)
+                                _resp.raise_for_status()
+                                with open(temp_file, 'ab') as f:
+                                    for chunk in _resp.iter_content(chunk_size=2*1024*1024):
+                                        if pause_event is not None and not pause_event.is_set():
+                                            while pause_event is not None and not pause_event.is_set():
+                                                if cancel_flag['cancelled']:
+                                                    raise Exception("同步被用户取消")
+                                                time.sleep(0.1)
+                                        if cancel_flag['cancelled']:
+                                            raise Exception("同步被用户取消")
+                                        if not chunk:
+                                            continue
+                                        ModUtils._limit_speed(len(chunk))
+                                        f.write(chunk)
+                            finally:
+                                try:
+                                    if _resp is not None:
+                                        _resp.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    _session.close()
+                                except Exception:
+                                    pass
+                        else:
+                            # 并发分段下载（自适应参数）
+                            try:
+                                sample = min(int(ModUtils.get_minio_settings().get('tune_sample_bytes', 4 * 1024 * 1024)), int(file_size or 4 * 1024 * 1024))
                             except Exception:
-                                pass
+                                sample = min(4 * 1024 * 1024, int(file_size or 4 * 1024 * 1024))
+                            try:
+                                http_bps = ModUtils._measure_http_speed(url, sample, pause_event)
+                            except Exception:
+                                http_bps = 0
+                            conc, part_sz = ModUtils._choose_parallel_params(http_bps, ModUtils.get_minio_settings() or {}, mode='http')
+                            ModUtils._http_parallel_download(url, temp_file, int(file_size or 0), pause_event, progress_callback, mod_id, part_size=part_sz, concurrency=conc)
                 finally:
                     progress_thread.stop()
                     progress_thread.join()
-                    if 'response' in locals():
-                        try:
-                            response['Body'].close()
-                        except Exception:
-                            pass
+                    try:
+                        resp_local = locals().get('response')
+                        if isinstance(resp_local, dict):
+                            body = resp_local.get('Body')
+                            try:
+                                if hasattr(body, 'close'):
+                                    body.close()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                 
                 # 验证文件完整性（仅检查文件大小）
                 is_valid, error_msg = ModUtils.verify_file(temp_file, expected_size=file_size, is_7z=False)
@@ -1455,6 +1529,215 @@ class ModUtils:
                 _backoff_sleep(attempt)
                 continue
         return False
+
+    @staticmethod
+    def _http_parallel_download(url: str, temp_file: str, file_size: int, pause_event: Optional[threading.Event], progress_callback: Optional[Callable], mod_id: Optional[str], part_size: Optional[int] = None, concurrency: Optional[int] = None):
+        import math
+        import requests as _rq
+        from requests.adapters import HTTPAdapter
+        # 准备文件
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
+        with open(temp_file, 'wb') as f:
+            try:
+                if file_size and file_size > 0:
+                    f.truncate(file_size)
+            except Exception:
+                pass
+        # 分段参数
+        settings = ModUtils.get_minio_settings() or {}
+        if part_size is None:
+            part_size = int(settings.get('http_part_size', 4 * 1024 * 1024))
+        if concurrency is None:
+            concurrency = int(settings.get('http_parallelism', max(8, (os.cpu_count() or 2) * 2)))
+        if not file_size or file_size <= 0:
+            # 无法分段时降级为单线程
+            part_size = 2 * 1024 * 1024
+            concurrency = 1
+        num_parts = math.ceil(file_size / part_size) if file_size > 0 else 1
+        # 进度聚合
+        progress = {
+            'done': 0,
+            'total': float(file_size or 0),
+            'last_t': time.time(),
+            'last_b': 0,
+            'lock': threading.Lock(),
+        }
+
+        def report(add_bytes: int):
+            with progress['lock']:
+                progress['done'] += int(add_bytes or 0)
+                now = time.time()
+                dt = max(1e-3, now - progress['last_t'])
+                ds = max(0, progress['done'] - progress['last_b'])
+                speed = ds / dt
+                progress['last_t'] = now
+                progress['last_b'] = progress['done']
+                p = (progress['done'] / progress['total'] * 100.0) if progress['total'] > 0 else 0.0
+                if progress_callback:
+                    try:
+                        progress_callback(mod_id, p, speed, 0, progress['done'], progress['total'], 'download')
+                    except Exception:
+                        pass
+
+        # 建立任务队列
+        ranges = []
+        for i in range(num_parts):
+            start = i * part_size
+            end = min(file_size - 1, (i + 1) * part_size - 1) if file_size > 0 else None
+            ranges.append((start, end))
+
+        def worker(tasks: queue.Queue):
+            sess = _rq.Session()
+            try:
+                adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
+                sess.mount('http://', adapter)
+                sess.mount('https://', adapter)
+            except Exception:
+                pass
+            headers_base = ModUtils.build_headers('*/*', {'Connection': 'keep-alive'})
+            while True:
+                if pause_event is not None and not pause_event.is_set():
+                    while pause_event is not None and not pause_event.is_set():
+                        time.sleep(0.1)
+                try:
+                    start, end = tasks.get_nowait()
+                except Exception:
+                    break
+                try:
+                    headers = dict(headers_base)
+                    if end is not None:
+                        headers['Range'] = f'bytes={start}-{end}'
+                    resp = sess.get(url, headers=headers, stream=True, timeout=max(5, ModUtils.CONFIG_SERVER['timeout']), allow_redirects=True)
+                    resp.raise_for_status()
+                    with open(temp_file, 'r+b') as f:
+                        f.seek(start)
+                        for chunk in resp.iter_content(chunk_size=512*1024):
+                            if not chunk:
+                                continue
+                            ModUtils._limit_speed(len(chunk))
+                            f.write(chunk)
+                            report(len(chunk))
+                except Exception:
+                    # 将失败的任务放回队列尾部，简易重试
+                    try:
+                        tasks.put((start, end))
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+                finally:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    tasks.task_done()
+            try:
+                sess.close()
+            except Exception:
+                pass
+
+        q = queue.Queue()
+        for it in ranges:
+            q.put(it)
+        threads = []
+        for _ in range(min(concurrency, len(ranges))):
+            t = threading.Thread(target=worker, args=(q,), daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
+
+    @staticmethod
+    def _measure_s3_speed(client, bucket: str, key: str, sample_bytes: int, pause_event: Optional[threading.Event]) -> float:
+        start = time.time()
+        got = 0
+        try:
+            rng = f"bytes=0-{max(0, sample_bytes - 1)}"
+            resp = client.get_object(Bucket=bucket, Key=key, Range=rng)
+            body = resp['Body']
+            for chunk in body.iter_chunks(chunk_size=512*1024):
+                if pause_event is not None and not pause_event.is_set():
+                    while pause_event is not None and not pause_event.is_set():
+                        time.sleep(0.05)
+                if not chunk:
+                    continue
+                got += len(chunk)
+        finally:
+            try:
+                body.close()
+            except Exception:
+                pass
+        dt = max(1e-3, time.time() - start)
+        return got / dt
+
+    @staticmethod
+    def _measure_http_speed(url: str, sample_bytes: int, pause_event: Optional[threading.Event]) -> float:
+        import requests as _rq
+        from requests.adapters import HTTPAdapter
+        sess = _rq.Session()
+        try:
+            adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=0)
+            sess.mount('http://', adapter)
+            sess.mount('https://', adapter)
+        except Exception:
+            pass
+        headers = ModUtils.build_headers('*/*', {'Range': f'bytes=0-{max(0, sample_bytes - 1)}', 'Connection': 'keep-alive'})
+        start = time.time()
+        got = 0
+        resp = None
+        try:
+            resp = sess.get(url, headers=headers, stream=True, timeout=max(3, ModUtils.CONFIG_SERVER['timeout']), allow_redirects=True)
+            resp.raise_for_status()
+            for chunk in resp.iter_content(chunk_size=256*1024):
+                if pause_event is not None and not pause_event.is_set():
+                    while pause_event is not None and not pause_event.is_set():
+                        time.sleep(0.05)
+                if not chunk:
+                    continue
+                got += len(chunk)
+        finally:
+            try:
+                if resp is not None:
+                    resp.close()
+            except Exception:
+                pass
+            try:
+                sess.close()
+            except Exception:
+                pass
+        dt = max(1e-3, time.time() - start)
+        return got / dt
+
+    @staticmethod
+    def _choose_parallel_params(speed_bps: float, settings: dict, mode: str = 's3') -> Tuple[int, int]:
+        # 基于测得速率与 CPU 核数建议并发与分块；可被 settings 覆盖上限
+        cpu = max(1, os.cpu_count() or 2)
+        mbps = (speed_bps or 0) / (1024*1024)
+        if mbps <= 2:
+            concurrency = min(4, cpu)
+            chunk = 1 * 1024 * 1024
+        elif mbps <= 10:
+            concurrency = min(8, cpu * 2)
+            chunk = 2 * 1024 * 1024
+        elif mbps <= 50:
+            concurrency = min(12, cpu * 2)
+            chunk = 4 * 1024 * 1024
+        else:
+            concurrency = min(16, cpu * 3)
+            chunk = 8 * 1024 * 1024
+        # 应用 settings 上限
+        if mode == 's3':
+            max_conc = int(settings.get('multipart_concurrency', concurrency))
+            max_chunk = int(settings.get('multipart_chunksize', chunk))
+        else:
+            max_conc = int(settings.get('http_parallelism', concurrency))
+            max_chunk = int(settings.get('http_part_size', chunk))
+        concurrency = min(max_conc, max(1, concurrency))
+        chunk = max(256*1024, min(max_chunk, chunk))
+        return concurrency, chunk
 
     @staticmethod
     def get_available_mod_lists() -> List[Dict[str, str]]:
@@ -1706,6 +1989,9 @@ class ModUtils:
                     resolved_key = ModUtils._resolved_keys.get(mid)
                     if resolved_key:
                         key_map[mid] = (resolved_key, int(size_map.get(mid, 0)))
+                    else:
+                        # 尝试临时解析
+                        pass
             except Exception:
                 pass
 
@@ -1736,7 +2022,7 @@ class ModUtils:
         return results
 
     @staticmethod
-    def process_mods_parallel(local_path: str, to_update: List[str], to_add: List[str], local_mods: Dict[str, dict], remote_mods: Dict[str, dict], progress_callback: Optional[Callable] = None, pause_event: Optional[threading.Event] = None) -> Dict[str, str]:
+    def process_mods_parallel(local_path: str, to_update: List[str], to_add: List[str], local_mods: Dict[str, dict], remote_mods: Dict[str, dict], progress_callback: Optional[Callable] = None, pause_event: Optional[threading.Event] = None, preferred_node: Optional[str] = None, mod_list: Optional[str] = None) -> Dict[str, str]:
         """并行处理：每个模组下载完成后立即解压，避免等待全部下载完成导致的延迟或取消时未解压。"""
         tasks: List[Tuple[str, str, str]] = []  # (mod_id, mod_name, mod_path)
         for mod_id in to_update:
@@ -1763,8 +2049,8 @@ class ModUtils:
                     mod_id,
                     local_path,
                     progress_callback=progress_callback,
-                    preferred_node=None,
-                    mod_list=None,
+                    preferred_node=preferred_node,
+                    mod_list=mod_list,
                     pause_event=pause_event,
                 )
                 if not ok:
@@ -1807,7 +2093,7 @@ class ModUtils:
                 if not ok_perm:
                     return mod_id, f"失败: 目标目录权限不足: {perr}"
 
-                if ModUtils.extract_mod(archive_path, mod_path):
+                if ModUtils.extract_mod(archive_path, mod_path, progress_callback=progress_callback, mod_id=mod_id):
                     # 在删除前记录文件大小，用于发送最终完成信号
                     try:
                         final_size = os.path.getsize(archive_path)
@@ -1815,8 +2101,8 @@ class ModUtils:
                         final_size = None
                     # 发送完成信号：进度100%、速度0、ETA 0、已下载=总大小
                     try:
-                        if progress_callback and final_size is not None:
-                            progress_callback(mod_id, 100.0, 0, 0, final_size, final_size)
+                        if progress_callback:
+                            progress_callback(mod_id, 100.0, 0, 0, 1, 1, 'extract')
                     except Exception:
                         pass
                     # 清理下载的7z文件
@@ -1860,7 +2146,7 @@ class ModUtils:
             return False 
 
     @staticmethod
-    def extract_mod(archive_path: str, target_path: str) -> bool:
+    def extract_mod(archive_path: str, target_path: str, progress_callback: Optional[Callable] = None, mod_id: Optional[str] = None) -> bool:
         """解压模组文件
         Args:
             archive_path: 7z文件路径
@@ -1879,9 +2165,54 @@ class ModUtils:
                 shutil.rmtree(temp_extract_path)
             os.makedirs(temp_extract_path, exist_ok=True)
 
-            # 流式解压：避免一次性占用过多内存
+            # 流式解压：避免一次性占用过多内存，并监控进度
             with py7zr.SevenZipFile(archive_path, mode='r') as z:
-                z.extractall(temp_extract_path)
+                try:
+                    names = z.getnames() or []
+                except Exception:
+                    names = []
+                total_files = 0
+                for n in names:
+                    try:
+                        if n and not str(n).endswith('/'):
+                            total_files += 1
+                    except Exception:
+                        continue
+
+                stop_flag = threading.Event()
+
+                def _monitor_extract():
+                    import time as _t
+                    last_p = -1
+                    while not stop_flag.is_set():
+                        try:
+                            done = 0
+                            for root, _, files in os.walk(temp_extract_path):
+                                done += len(files)
+                            if total_files <= 0:
+                                p = 0.0
+                            else:
+                                p = min(99.0, (done / max(1, total_files)) * 100.0)
+                            if progress_callback and mod_id is not None and abs(p - last_p) >= 1.0:
+                                try:
+                                    progress_callback(mod_id, p, 0, 0, done, max(1, total_files), 'extract')
+                                except Exception:
+                                    pass
+                                last_p = p
+                        except Exception:
+                            pass
+                        _t.sleep(0.3)
+
+                monitor_thread = None
+                if progress_callback and mod_id is not None:
+                    monitor_thread = threading.Thread(target=_monitor_extract, daemon=True)
+                    monitor_thread.start()
+                try:
+                    z.extractall(temp_extract_path)
+                finally:
+                    stop_flag.set()
+                    if monitor_thread:
+                        monitor_thread.join(timeout=1.0)
 
             # 检查解压后的文件结构
             extracted_items = os.listdir(temp_extract_path)

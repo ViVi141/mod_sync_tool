@@ -2,8 +2,8 @@
 
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(3, 0, 0, 0),
-    prodvers=(3, 0, 0, 0),
+    filevers=(3, 1, 0, 0),
+    prodvers=(3, 1, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -18,12 +18,12 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'TASK军事模拟俱乐部'),
           StringStruct('FileDescription', 'Arma Reforger 模组同步器'),
-          StringStruct('FileVersion', '3.0.0'),
+          StringStruct('FileVersion', '3.1.0'),
           StringStruct('InternalName', 'mod_sync_tool'),
           StringStruct('LegalCopyright', 'Copyright © 2025 TASK'),
-          StringStruct('OriginalFilename', 'mod_sync_tool_v3.0.0.exe'),
+          StringStruct('OriginalFilename', 'mod_sync_tool_v3.1.0.exe'),
           StringStruct('ProductName', 'TASK 模组同步器'),
-          StringStruct('ProductVersion', '3.0.0')
+          StringStruct('ProductVersion', '3.1.0')
         ]
       )
     ]),
