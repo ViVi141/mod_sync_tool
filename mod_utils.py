@@ -1320,51 +1320,8 @@ class ModUtils:
                 
                 # 下载到临时文件
                 start_time = time.time()
-                
                 cancel_flag = {'cancelled': False}
-
-                class ProgressThread(threading.Thread):
-                    def __init__(self):
-                        super().__init__()
-                        self.daemon = True
-                        self._stop_event = threading.Event()
-                        self._downloaded_size = local_size
-                        self._last_time = start_time
-                        self._last_size = local_size
-                        
-                    def stop(self):
-                        self._stop_event.set()
-                        
-                    def run(self):
-                        while not self._stop_event.is_set():
-                            try:
-                                if os.path.exists(temp_file):
-                                    current_size = os.path.getsize(temp_file)
-                                    if current_size > self._downloaded_size:
-                                        now_ts = time.time()
-                                        delta_t = now_ts - self._last_time
-                                        delta_s = current_size - self._last_size
-                                        speed = (delta_s / delta_t) if delta_t > 0 else 0
-                                        remain = file_size - current_size
-                                        eta = remain / speed if speed > 0 else 0
-                                        progress = (current_size / file_size) * 100
-                                        if progress_callback:
-                                            try:
-                                                ret = progress_callback(mod_id, progress, speed, eta, current_size, file_size, 'download')
-                                                if ret is False:
-                                                    cancel_flag['cancelled'] = True
-                                                    break
-                                            except Exception as e:
-                                                ModUtils.logger.error(f"进度回调错误: {str(e)}")
-                                        self._downloaded_size = current_size
-                                        self._last_time = now_ts
-                                        self._last_size = current_size
-                            except Exception as e:
-                                ModUtils.logger.error(f"进度更新错误: {str(e)}")
-                            time.sleep(0.5)
-                
-                progress_thread = ProgressThread()
-                progress_thread.start()
+                progress_thread = None
                 
                 try:
                     if not http_mode:
@@ -1387,6 +1344,7 @@ class ModUtils:
                                     now = time.time()
                                     dt = max(1e-3, now - self.last_t)
                                     ds = max(0, self.done - self.last_b)
+                                    # 使用回调内即时增量作为瞬时速度
                                     speed = ds / dt
                                     self.last_t = now
                                     self.last_b = self.done
@@ -1424,6 +1382,46 @@ class ModUtils:
                         # 选择模式
                         if local_size > 0 and file_size and local_size < file_size:
                             # 顺序续传回退
+                            # 在顺序续传模式下启动监控线程（并发模式预分配文件长度会导致误判，故仅此处启用）
+                            class ProgressThread(threading.Thread):
+                                def __init__(self):
+                                    super().__init__()
+                                    self.daemon = True
+                                    self._stop_event = threading.Event()
+                                    self._downloaded_size = local_size
+                                    self._last_time = start_time
+                                    self._last_size = local_size
+                                def stop(self):
+                                    self._stop_event.set()
+                                def run(self):
+                                    while not self._stop_event.is_set():
+                                        try:
+                                            if os.path.exists(temp_file):
+                                                current_size = os.path.getsize(temp_file)
+                                                if current_size >= self._downloaded_size:
+                                                    now_ts = time.time()
+                                                    delta_t = now_ts - self._last_time
+                                                    delta_s = max(0, current_size - self._last_size)
+                                                    speed = (delta_s / delta_t) if delta_t > 0 else 0
+                                                    remain = max(0, (file_size or 0) - current_size)
+                                                    eta = remain / speed if speed > 0 else 0
+                                                    progress = ((current_size / file_size) * 100) if file_size else 0
+                                                    if progress_callback:
+                                                        try:
+                                                            ret = progress_callback(mod_id, progress, speed, eta, current_size, file_size or 0, 'download')
+                                                            if ret is False:
+                                                                cancel_flag['cancelled'] = True
+                                                                break
+                                                        except Exception as e:
+                                                            ModUtils.logger.error(f"进度回调错误: {str(e)}")
+                                                    self._downloaded_size = current_size
+                                                    self._last_time = now_ts
+                                                    self._last_size = current_size
+                                        except Exception as e:
+                                            ModUtils.logger.error(f"进度更新错误: {str(e)}")
+                                        time.sleep(0.3)
+                            progress_thread = ProgressThread()
+                            progress_thread.start()
                             import requests as _rq
                             from requests.adapters import HTTPAdapter
                             headers = ModUtils.build_headers('*/*', {'Connection': 'keep-alive'})
@@ -1475,8 +1473,12 @@ class ModUtils:
                             conc, part_sz = ModUtils._choose_parallel_params(http_bps, ModUtils.get_minio_settings() or {}, mode='http')
                             ModUtils._http_parallel_download(url, temp_file, int(file_size or 0), pause_event, progress_callback, mod_id, part_size=part_sz, concurrency=conc)
                 finally:
-                    progress_thread.stop()
-                    progress_thread.join()
+                    try:
+                        if progress_thread is not None:
+                            progress_thread.stop()
+                            progress_thread.join()
+                    except Exception:
+                        pass
                     try:
                         resp_local = locals().get('response')
                         if isinstance(resp_local, dict):
