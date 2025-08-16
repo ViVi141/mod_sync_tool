@@ -57,8 +57,22 @@ class MainWindow:
 		except Exception:
 			pass
 		
-		# 检查版本更新
+		# 初始化并检查软件更新（不阻塞UI）
 		ModUtils.initialize()
+		try:
+			def _check_app_update():
+				need, cur, latest, notes, url, mandatory = ModUtils.get_version_info()
+				if need:
+					msg = f"发现新版本: {latest}\n当前版本: {cur}\n\n{notes or ''}\n"
+					if url:
+						msg += f"\n下载地址:\n{url}\n"
+					if mandatory:
+						self._show_warning("需要更新", msg)
+					else:
+						self._show_info("发现更新", msg)
+			threading.Thread(target=_check_app_update, daemon=True).start()
+		except Exception:
+			pass
 		
 	def setup_logging(self):
 		"""设置日志系统"""
@@ -742,7 +756,7 @@ class MainWindow:
 				self._show_error("错误", "请选择模组列表")
 				return
 				
-			# 获取本地模组
+			# 获取本地模组（并发扫描，后台补全大小）
 			self.log_message("开始扫描本地模组...")
 			try:
 				self.root.after(0, lambda: self.status_var.set("正在扫描本地模组..."))
@@ -766,7 +780,7 @@ class MainWindow:
 					return
 				raise
 			
-			# 获取远程模组
+			# 获取远程模组（命中缓存则极快）
 			self.log_message("正在连接云端服务器...")
 			try:
 				self.root.after(0, lambda: self.status_var.set("正在连接云端服务器..."))
@@ -785,9 +799,10 @@ class MainWindow:
 				pass
 			to_update, to_add, to_remove = ModUtils.compare_mods(local_mods, remote_mods)
 			
-			# 预取云端大小
+			# 预取云端大小（仅对需要更新/新增的模组，减少请求量）
 			try:
-				remote_size_map = ModUtils.prefetch_sizes(list(remote_mods.keys()), selected_list)
+				all_targets = list(set(to_update + to_add))
+				remote_size_map = ModUtils.prefetch_sizes(all_targets, selected_list)
 			except Exception:
 				remote_size_map = {}
 
@@ -810,7 +825,8 @@ class MainWindow:
 				remote_version = remote_info.get('version', 'unknown')
 				status = ModUtils.compare_versions(info['version'], remote_version)
 				local_size = fmt_size(info.get('size', 0))
-				remote_size = fmt_size(remote_size_map.get(mod_id, 0))
+				# 仅在需要更新时展示云端大小
+				remote_size = fmt_size(remote_size_map.get(mod_id, 0)) if mod_id in to_update else ''
 				self.tree.insert('', 'end', iid=mod_id, values=(
 					info['name'],
 					info['version'],

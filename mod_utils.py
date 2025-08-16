@@ -49,9 +49,9 @@ logging.getLogger().addFilter(SensitiveFilter())
 class ModUtils:
     # 版本信息
     VERSION = "3.1.0"  # 当前版本
-    MIN_VERSION = "3.1.0"  # 最低支持版本
-    VERSION_CHECK_URL = "https://www.vivi141.com/version.json"  # 版本检查URL
-    VERSION_CACHE_FILE = ".version_cache.json"
+    # MIN_VERSION 保留，但默认从服务端 version.json 的 min/min_version 获取；本地仅作兜底。
+    MIN_VERSION = "0.0.0"
+    # 版本检查改为统一使用 CONFIG_SERVER['endpoints']['version']，不再单独配置 URL
     
     logger = logger
     # 配置服务器
@@ -116,13 +116,40 @@ class ModUtils:
             目标目录完整路径
         """
         try:
-            if isinstance(mod_name, str) and mod_name.lower().endswith(f"_{mod_id.lower()}"):
-                final_name = mod_name
+            safe_name = ModUtils.normalize_name_for_filename(mod_name)
+            target = safe_name if isinstance(safe_name, str) else str(safe_name)
+            suffix = f"_{mod_id}"
+            if target.lower().endswith(suffix.lower()):
+                final_name = target
             else:
-                final_name = f"{mod_name}_{mod_id}"
+                final_name = f"{target}{suffix}"
         except Exception:
-            final_name = f"{mod_name}_{mod_id}"
+            final_name = f"{str(mod_name).replace(' ', '')}_{mod_id}"
         return os.path.join(base_dir, final_name)
+
+    @staticmethod
+    def normalize_name_for_filename(name: str) -> str:
+        try:
+            # 去掉空格，保留字母、数字、常见符号 -_.
+            return ''.join(ch for ch in str(name) if (ch.isalnum() or ch in '-_.'))
+        except Exception:
+            return str(name).replace(' ', '')
+
+    @staticmethod
+    def build_default_filename(name: str, mod_id: str, version: Optional[str]) -> str:
+        safe = ModUtils.normalize_name_for_filename(name or f'mod_{mod_id}')
+        ver = (version or '').strip()
+        if ver:
+            return f"{safe}_{mod_id}_{ver}.7z"
+        return f"{safe}_{mod_id}.7z"
+
+    @staticmethod
+    def build_filename_variants(name: str, mod_id: str, version: Optional[str]) -> List[str]:
+        safe = ModUtils.normalize_name_for_filename(name or f'mod_{mod_id}')
+        ver = (version or '').strip()
+        if not ver:
+            return []
+        return [f"{safe}_{mod_id}_{ver}.7z"]
 
     # 下载队列
     download_queue = queue.Queue()
@@ -177,22 +204,61 @@ class ModUtils:
         return str(err)
 
     @staticmethod
-    def check_version() -> Tuple[bool, str, str, str]:
-        """检查版本更新
-        Returns:
-            Tuple[bool, str, str, str]: (是否需要更新, 当前版本, 最新版本, 更新说明)
-        """
-        # 按用户要求，彻底禁用版本检查
-        return False, ModUtils.VERSION, ModUtils.VERSION, "版本检查已禁用"
+    def _parse_version_tuple(v: str) -> Tuple[int, ...]:
+        try:
+            parts = []
+            for p in str(v).strip().split('.'):
+                if p.isdigit():
+                    parts.append(int(p))
+                else:
+                    # 忽略非数字后缀，如 1.2.3-beta
+                    num = ''.join(ch for ch in p if ch.isdigit())
+                    parts.append(int(num) if num else 0)
+            return tuple(parts or [0])
+        except Exception:
+            return (0,)
 
     @staticmethod
-    def get_version_info() -> Tuple[bool, str, str, str]:
+    def _cmp_version(a: str, b: str) -> int:
+        aa = ModUtils._parse_version_tuple(a)
+        bb = ModUtils._parse_version_tuple(b)
+        # 统一长度比较
+        n = max(len(aa), len(bb))
+        aa = aa + (0,) * (n - len(aa))
+        bb = bb + (0,) * (n - len(bb))
+        return (aa > bb) - (aa < bb)
+
+    @staticmethod
+    def get_version_info() -> Tuple[bool, str, str, str, str, bool]:
         """获取版本信息并检查更新
         Returns:
-            Tuple[bool, str, str, str]: (是否需要更新, 当前版本, 最新版本, 消息)
+            (need_update, current, latest, changelog, download_url, mandatory)
         """
-        # 按用户要求，彻底禁用版本检查
-        return False, ModUtils.VERSION, ModUtils.VERSION, "版本检查已禁用"
+        current = ModUtils.VERSION
+        try:
+            # 先查缓存
+            ck = 'app_version_info'
+            ttl = 3600
+            now = time.time()
+            if ck in ModUtils._config_cache and (now - ModUtils._config_cache_time.get(ck, 0)) < ttl:
+                info = ModUtils._config_cache[ck]
+            else:
+                info = ModUtils.fetch_config(ModUtils.CONFIG_SERVER['endpoints']['version'].lstrip('/'))
+                if not info:
+                    return False, current, current, '', '', False
+                ModUtils._config_cache[ck] = info
+                ModUtils._config_cache_time[ck] = now
+
+            latest = str(info.get('latest') or info.get('latest_version') or info.get('version') or current)
+            min_support = str(info.get('min') or info.get('min_version') or ModUtils.MIN_VERSION)
+            changelog = str(info.get('changelog') or info.get('notes') or '')
+            download_url = str(info.get('url') or info.get('download_url') or '')
+            mandatory = bool(info.get('mandatory') or info.get('force') or (ModUtils._cmp_version(current, min_support) < 0))
+
+            need_update = ModUtils._cmp_version(current, latest) < 0
+            return need_update, current, latest, changelog, download_url, mandatory
+        except Exception:
+            return False, current, current, '', '', False
 
     @staticmethod
     def fetch_config(endpoint):
@@ -316,39 +382,78 @@ class ModUtils:
 
     @staticmethod
     def get_local_mods(local_path: str) -> Dict[str, dict]:
-        """扫描本地模组文件夹，返回模组信息字典"""
-        mods = {}
-        
+        """扫描本地模组文件夹，返回模组信息字典（并发读取 + 按需计算大小）"""
+        mods: Dict[str, dict] = {}
         # 检查路径权限
         has_permission, error_msg = ModUtils.check_path_permissions(local_path)
         if not has_permission:
             raise Exception(f"路径权限错误: {error_msg}")
-            
         if not os.path.exists(local_path):
             return mods
 
-        for folder in os.listdir(local_path):
-            folder_path = os.path.join(local_path, folder)
-            if os.path.isdir(folder_path):
+        entries = []
+        try:
+            entries = [os.path.join(local_path, d) for d in os.listdir(local_path)]
+        except Exception:
+            return mods
+
+        # 先快速并发读取 ServerData.json，延迟计算文件夹大小（仅必要时计算）
+        def read_one(folder_path: str) -> Optional[Tuple[str, dict]]:
+            try:
+                if not os.path.isdir(folder_path):
+                    return None
                 server_data_path = os.path.join(folder_path, 'ServerData.json')
-                if os.path.exists(server_data_path):
-                    try:
-                        with open(server_data_path, 'r', encoding='utf-8-sig') as f:
-                            data = json.load(f)
-                            mod_id = data.get('id', '')
-                            version = data.get('revision', {}).get('version', '')
-                            if mod_id:
-                                mods[mod_id] = {
-                                    'name': folder,
-                                    'version': version,
-                                    'path': folder_path,
-                                    'size': ModUtils.get_folder_size_safe(folder_path)
-                                }
-                    except PermissionError:
-                        logging.error(f"无法读取文件: {server_data_path}")
-                        continue
-                    except Exception:
-                        continue
+                if not os.path.exists(server_data_path):
+                    return None
+                with open(server_data_path, 'r', encoding='utf-8-sig') as f:
+                    data = json.load(f)
+                mod_id = data.get('id', '')
+                version = data.get('revision', {}).get('version', '')
+                if not mod_id:
+                    return None
+                # 先不计算 size，按需再算
+                item = {
+                    'name': os.path.basename(folder_path),
+                    'version': version,
+                    'path': folder_path,
+                    'size': 0,
+                }
+                return mod_id, item
+            except Exception:
+                return None
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # SSD 情况提升并发上限；仍然避免过高以免线程切换开销
+        max_workers = min(24, max(8, (os.cpu_count() or 8)))
+        futures = []
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for p in entries:
+                futures.append(ex.submit(read_one, p))
+            for fu in as_completed(futures):
+                res = None
+                try:
+                    res = fu.result()
+                except Exception:
+                    res = None
+                if res:
+                    mid, item = res
+                    mods[mid] = item
+
+        # 按需计算文件夹大小：当 UI 需要展示或排序时再触发
+        # 提供一个后台计算的机会（不阻塞主检查流程）
+        def _bg_calc_sizes(items: Dict[str, dict]):
+            for mid, it in items.items():
+                if it.get('size', 0) > 0:
+                    continue
+                try:
+                    it['size'] = ModUtils.get_folder_size_safe(it['path'])
+                except Exception:
+                    it['size'] = 0
+        try:
+            threading.Thread(target=_bg_calc_sizes, args=(mods,), daemon=True).start()
+        except Exception:
+            pass
+
         return mods
 
     @staticmethod
@@ -553,6 +658,18 @@ class ModUtils:
     def get_remote_mods(mod_list=None):
         """获取远程模组列表"""
         try:
+            # 简易缓存：减少重复网络请求
+            try:
+                cache_key = f"remote_mods::{str(mod_list) if mod_list else 'default'}"
+                ttl = int(ModUtils.CONFIG_SERVER.get('cache_time', 60))
+                if cache_key in ModUtils._config_cache:
+                    t0 = ModUtils._config_cache_time.get(cache_key, 0)
+                    if time.time() - t0 < ttl:
+                        cached = ModUtils._config_cache.get(cache_key)
+                        if isinstance(cached, dict) and cached:
+                            return cached
+            except Exception:
+                pass
             # 获取模组列表配置
             mod_lists = ModUtils.get_mod_lists()
             if not mod_lists:
@@ -585,12 +702,31 @@ class ModUtils:
                 mods = response.json()
                 # 确保每个模组都有完整的文件名信息
                 for mod_id, info in mods.items():
-                    if 'filename' not in info:
-                        info['filename'] = f"{info['name']}_{mod_id}.7z"
-                    if 'path' not in info:
+                    # 强制要求版本存在
+                    ver = str(info.get('version') or '').strip()
+                    if not ver:
+                        raise ValueError(f"模组 {mod_id} 缺少 version 字段")
+                    name_part = str(info.get('name', f'mod_{mod_id}'))
+                    # 采用“保留空格”的规则文件名，确保与桶内实际文件一致
+                    expect_fn_raw = f"{name_part}_{mod_id}_{ver}.7z"
+                    cur_fn = str(info.get('filename') or '').strip()
+                    # 仅接受形如 *_ModID_Version.7z
+                    import re as _re
+                    pattern = _re.compile(rf".+_{_re.escape(mod_id)}_[^/]+\.7z$")
+                    if not cur_fn or not pattern.match(cur_fn):
+                        info['filename'] = expect_fn_raw
+                    else:
+                        info['filename'] = cur_fn
+                    if 'path' not in info or not info.get('path'):
                         info['path'] = info['filename']
                     if 'size' not in info:
                         info['size'] = 0
+                # 写入缓存
+                try:
+                    ModUtils._config_cache[cache_key] = mods
+                    ModUtils._config_cache_time[cache_key] = time.time()
+                except Exception:
+                    pass
                 return mods
             except Exception as e:
                 logging.warning(f"HTTP获取mod_info.json失败，尝试R2直连获取: {str(e)}")
@@ -621,11 +757,21 @@ class ModUtils:
                 # 读取模组信息
                 with open(temp_file, 'r', encoding='utf-8') as f:
                     mods = json.load(f)
-                    # 确保每个模组都有完整的文件名信息
+                    # 确保每个模组都有完整的文件名信息（Name_ModID_Version.7z）
                     for mod_id, info in mods.items():
-                        if 'filename' not in info:
-                            info['filename'] = f"{info['name']}_{mod_id}.7z"
-                        if 'path' not in info:
+                        ver = str(info.get('version') or '').strip()
+                        if not ver:
+                            raise ValueError(f"模组 {mod_id} 缺少 version 字段")
+                        name_part = info.get('name', f'mod_{mod_id}')
+                        expect_fn = ModUtils.build_default_filename(name_part, mod_id, ver)
+                        cur_fn = str(info.get('filename') or '').strip()
+                        import re as _re
+                        pattern = _re.compile(rf".+_{_re.escape(mod_id)}_[^/]+\.7z$")
+                        if not cur_fn or not pattern.match(cur_fn):
+                            info['filename'] = expect_fn
+                        else:
+                            info['filename'] = cur_fn
+                        if 'path' not in info or not info.get('path'):
                             info['path'] = info['filename']
                         if 'size' not in info:
                             info['size'] = 0
@@ -633,6 +779,7 @@ class ModUtils:
                     
             except Exception as e:
                 logging.error(f"获取模组信息失败: {str(e)}")
+                # 失败情况下不缓存
                 return {}
                 
             finally:
@@ -1175,7 +1322,7 @@ class ModUtils:
                 if node_info and (node_info.get('type') == 'r2_http' or 'public_url_base' in node_info):
                     http_mode = True
 
-                # 若为 R2（HTTP 模式或 R2 S3 端点），为对象键自动套前缀（仅限 R2）
+                # R2 端点识别
                 is_r2_s3 = False
                 try:
                     if not http_mode and node_info and isinstance(node_info.get('endpoint'), str):
@@ -1183,13 +1330,8 @@ class ModUtils:
                 except Exception:
                     is_r2_s3 = False
 
-                if http_mode or is_r2_s3:
-                    settings_for_prefix = ModUtils.get_minio_settings() or {}
-                    obj_prefix = str(settings_for_prefix.get('object_prefix', 'uploads/1/mods')).strip('/')
-                    norm_path = str(remote_path).lstrip('/').replace('\\', '/')
-                    if obj_prefix and not norm_path.startswith(obj_prefix + '/'):
-                        norm_path = f"{obj_prefix}/{norm_path}"
-                    remote_path = norm_path
+                # 所有 7z 已放根目录：不再拼接任何 object_prefix
+                remote_path = str(remote_path).lstrip('/').replace('\\', '/')
 
                 # 统一：通过候选键探测真实对象键与大小（不做全量列举/索引）
                 def _resolve_key_and_size() -> Tuple[Optional[str], Optional[int], Optional[str]]:
@@ -1197,8 +1339,29 @@ class ModUtils:
                     filename = info.get('filename', remote_filename)
                     name = info.get('name', '')
                     version = info.get('version', '')
-                    object_prefix = str((settings or {}).get('object_prefix', 'uploads/1/mods')).strip('/')
-                    key_template = str((settings or {}).get('object_key_template', '')).strip()
+                    # 若提供了直链 URL（支持前缀 @http/@https），直接使用
+                    def _as_url(s: Optional[str]) -> Optional[str]:
+                        if not s:
+                            return None
+                        s = str(s).strip()
+                        if s.startswith('@http://') or s.startswith('@https://'):
+                            return s[1:]
+                        if s.startswith('http://') or s.startswith('https://'):
+                            return s
+                        return None
+                    # 直链优先：resolved_path > info.path > filename
+                    url_direct = _as_url(resolved_path) or _as_url(info.get('path')) or _as_url(filename)
+                    if url_direct:
+                        # 尝试探测大小
+                        try:
+                            headers = ModUtils.build_headers('*/*')
+                            resp = requests.head(url_direct, timeout=max(2, ModUtils.CONFIG_SERVER['timeout']), headers=headers, allow_redirects=True)
+                            if resp.status_code < 400 and resp.headers.get('Content-Length'):
+                                return None, int(resp.headers['Content-Length']), url_direct
+                        except Exception:
+                            pass
+                        return None, None, url_direct
+                    # 根目录策略：不使用任何模板
 
                     # 组装候选键
                     candidates: List[str] = []
@@ -1211,25 +1374,10 @@ class ModUtils:
                     raw_path = str(info.get('path') or '').strip()
                     if raw_path:
                         candidates.append(raw_path.lstrip('/'))
-                    # 3) 模板
-                    if key_template:
-                        try:
-                            rendered = key_template.format(
-                                object_prefix=object_prefix,
-                                mod_id=mod_id,
-                                filename=filename,
-                                name=name,
-                                version=version,
-                            ).strip('/').replace('\\', '/')
-                            if rendered:
-                                candidates.append(rendered)
-                        except Exception:
-                            pass
-                    # 4) 常规：prefix/filename 与 filename
-                    norm_filename = str(filename).lstrip('/').replace('\\', '/')
-                    if object_prefix:
-                        candidates.append(f"{object_prefix}/{norm_filename}")
-                    candidates.append(norm_filename)
+                    # 不使用模板；仅使用显式 path 与标准文件名
+                    # 3) 常规：标准文件名（根目录），按 Name_ModID_Version.7z 规则拼接，保留空格
+                    rule_filename = f"{name}_{mod_id}_{version}.7z".lstrip('/').replace('\\', '/')
+                    candidates.append(rule_filename)
 
                     # 去重保持顺序
                     seen = set()
@@ -1243,45 +1391,61 @@ class ModUtils:
                             ordered_candidates.append(c)
 
                     # 探测
-                    if http_mode and node_info:
+                    # 优先使用 HTTP 直连探测：允许从节点 endpoint 推导 base（即使未显式配置 public_url_base）
+                    if node_info:
                         base = node_info.get('public_url_base')
                         if not base:
+                            try:
+                                ep = str(node_info.get('endpoint', '')).strip()
+                                if ep:
+                                    if ep.startswith('http://') or ep.startswith('https://'):
+                                        base = ep
+                                    else:
+                                        scheme = 'https' if node_info.get('secure', True) else 'http'
+                                        base = f"{scheme}://{ep}"
+                            except Exception:
+                                base = None
+                        if not base:
                             return None, None, None
-                        include_bucket = bool(node_info.get('bucket_in_path', True))
                         http_timeout = max(2, int(settings.get('timeout', ModUtils.CONFIG_SERVER['timeout'])))
                         headers = ModUtils.build_headers('*/*', {'Connection': 'close'})
+                        from urllib.parse import quote as _q
                         for key in ordered_candidates:
-                            try:
-                                if include_bucket:
-                                    test_url = f"{base.rstrip('/')}/{bucket}/{key}"
-                                else:
-                                    test_url = f"{base.rstrip('/')}/{key}"
-                                head_resp = requests.head(test_url, timeout=http_timeout, headers=headers, allow_redirects=True)
-                                if head_resp.status_code < 400 and head_resp.headers.get('Content-Length'):
-                                    size_val = int(head_resp.headers['Content-Length'])
-                                    return key, size_val, test_url
-                                # 某些环境禁 HEAD：降级到 GET range(0-0) 探测
-                                get_headers = dict(headers)
-                                get_headers['Range'] = 'bytes=0-0'
-                                get_resp = requests.get(test_url, timeout=http_timeout, headers=get_headers, stream=True, allow_redirects=True)
-                                if get_resp.status_code in (200, 206):
-                                    cr = get_resp.headers.get('Content-Range', '')
-                                    # Content-Range: bytes 0-0/12345
-                                    if '/' in cr:
-                                        total = cr.split('/')[-1]
-                                        if total.isdigit():
-                                            return key, int(total), test_url
-                            except Exception:
-                                continue
-                            finally:
+                            # 同时尝试“带 bucket”和“不带 bucket”两种 URL 形式，增强兼容性
+                            for with_bucket in (True, False):
+                                k_enc = _q(key, safe='/ ')
+                                test_url = f"{base.rstrip('/')}/{bucket}/{k_enc}" if with_bucket else f"{base.rstrip('/')}/{k_enc}"
+                                head_resp = None
+                                get_resp = None
                                 try:
-                                    head_resp.close()
+                                    head_resp = requests.head(test_url, timeout=http_timeout, headers=headers, allow_redirects=True)
+                                    if head_resp.status_code < 400 and head_resp.headers.get('Content-Length'):
+                                        size_val = int(head_resp.headers['Content-Length'])
+                                        return key, size_val, test_url
+                                    # 某些环境禁 HEAD：降级到 GET range(0-0) 探测
+                                    get_headers = dict(headers)
+                                    get_headers['Range'] = 'bytes=0-0'
+                                    get_resp = requests.get(test_url, timeout=http_timeout, headers=get_headers, stream=True, allow_redirects=True)
+                                    if get_resp.status_code in (200, 206):
+                                        cr = get_resp.headers.get('Content-Range', '')
+                                        if '/' in cr:
+                                            total = cr.split('/')[-1]
+                                            if total.isdigit():
+                                                return key, int(total), test_url
                                 except Exception:
-                                    pass
-                                try:
-                                    get_resp.close()
-                                except Exception:
-                                    pass
+                                    continue
+                                finally:
+                                    try:
+                                        head_resp.close()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        get_resp.close()
+                                    except Exception:
+                                        pass
+                        # 探测失败但我们仍然有候选键时，返回首个候选键，大小未知
+                        if ordered_candidates:
+                            return ordered_candidates[0], None, None
                         return None, None, None
                     else:
                         if not client:
@@ -1292,6 +1456,9 @@ class ModUtils:
                                 return key, int(st.get('ContentLength', 0) or 0), None
                             except Exception:
                                 continue
+                        # 探测失败但我们仍然有候选键时，返回首个候选键，大小未知
+                        if ordered_candidates:
+                            return ordered_candidates[0], None, None
                         return None, None, None
 
                 # 解析真实键与大小
@@ -1324,6 +1491,8 @@ class ModUtils:
                 progress_thread = None
                 
                 try:
+                    # 统一取消事件（供并发HTTP使用）
+                    cancel_evt_local = threading.Event()
                     if not http_mode:
                         # 优先使用 S3 并发多段下载（最快）。若存在部分临时文件则重新下载以避免复杂续传问题。
                         if os.path.exists(temp_file):
@@ -1340,6 +1509,11 @@ class ModUtils:
                                 self.last_b = 0
                             def __call__(self, bytes_amount):
                                 try:
+                                    # 支持暂停/取消
+                                    if pause_event is not None and not pause_event.is_set():
+                                        while pause_event is not None and not pause_event.is_set():
+                                            time.sleep(0.1)
+                                    # 取消由外层捕捉；此处保持轻量
                                     self.done += int(bytes_amount or 0)
                                     now = time.time()
                                     dt = max(1e-3, now - self.last_t)
@@ -1350,7 +1524,14 @@ class ModUtils:
                                     self.last_b = self.done
                                     p = (self.done / self.total * 100.0) if self.total > 0 else 0.0
                                     if progress_callback:
-                                        progress_callback(mod_id, p, speed, 0, self.done, self.total, 'download')
+                                        # 若回调返回 False，视为取消
+                                        try:
+                                            cont = progress_callback(mod_id, p, speed, 0, self.done, self.total, 'download')
+                                            if cont is False:
+                                                raise Exception("同步被用户取消")
+                                        except Exception as _cb_err:
+                                            # 显式抛出用于中断传输
+                                            raise
                                 except Exception:
                                     pass
                         cfg = ModUtils.get_minio_settings() or {}
@@ -1368,17 +1549,91 @@ class ModUtils:
                             use_threads=True,
                         ))
                         cb = _S3CB(file_size or 0)
-                        transfer.download_file(bucket, real_key, temp_file, callback=cb)
+                        try:
+                            transfer.download_file(bucket, real_key, temp_file, callback=cb)
+                        except ClientError as ce:
+                            # 若对象在 S3 端返回 404，则回退到 HTTP 直连（若节点提供 public_url_base）
+                            try:
+                                status = int(ce.response.get('ResponseMetadata', {}).get('HTTPStatusCode', 0))
+                            except Exception:
+                                status = 0
+                            if status == 404 and node_info and node_info.get('public_url_base'):
+                                base = node_info.get('public_url_base')
+                                # 尝试两种 URL 形式
+                                http_timeout = max(5, int(settings.get('timeout', ModUtils.CONFIG_SERVER['timeout'])))
+                                headers = ModUtils.build_headers('*/*', {'Connection': 'keep-alive'})
+                                url_try = None
+                                size_detected = None
+                                from urllib.parse import quote as _q
+                                for with_bucket in (True, False):
+                                    rk_enc = _q(real_key, safe='/ ')
+                                    test_url = f"{base.rstrip('/')}/{bucket}/{rk_enc}" if with_bucket else f"{base.rstrip('/')}/{rk_enc}"
+                                    head_resp = None
+                                    get_resp = None
+                                    try:
+                                        head_resp = requests.head(test_url, timeout=http_timeout, headers=headers, allow_redirects=True)
+                                        if head_resp.status_code < 400 and head_resp.headers.get('Content-Length'):
+                                            size_detected = int(head_resp.headers['Content-Length'])
+                                            url_try = test_url
+                                            break
+                                        # 降级 GET range 探测
+                                        get_headers = dict(headers)
+                                        get_headers['Range'] = 'bytes=0-0'
+                                        get_resp = requests.get(test_url, timeout=http_timeout, headers=get_headers, stream=True, allow_redirects=True)
+                                        if get_resp.status_code in (200, 206):
+                                            cr = get_resp.headers.get('Content-Range', '')
+                                            if '/' in cr:
+                                                total = cr.split('/')[-1]
+                                                if total.isdigit():
+                                                    size_detected = int(total)
+                                                    url_try = test_url
+                                                    break
+                                    except Exception:
+                                        continue
+                                    finally:
+                                        try:
+                                            head_resp.close()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            get_resp.close()
+                                        except Exception:
+                                            pass
+                                if url_try:
+                                    # 使用 HTTP 并发下载作为回退
+                                    # 若未探测到大小，则置零并降级到单线程
+                                    if not file_size and size_detected:
+                                        file_size = int(size_detected)
+                                    conc, part_sz = ModUtils._choose_parallel_params(0, ModUtils.get_minio_settings() or {}, mode='http')
+                                    ModUtils._http_parallel_download(
+                                        url_try,
+                                        temp_file,
+                                        int(file_size or 0),
+                                        pause_event,
+                                        progress_callback,
+                                        mod_id,
+                                        part_size=part_sz,
+                                        concurrency=conc,
+                                        cancel_event=cancel_evt_local,
+                                    )
+                                    if cancel_evt_local.is_set():
+                                        raise Exception("同步被用户取消")
+                                else:
+                                    raise
+                            else:
+                                raise
                     else:
                         # HTTP 并发分段下载：若已有部分临时文件，则退回到顺序续传（保留断点续传能力）。
                         http_timeout = max(5, int(settings.get('timeout', ModUtils.CONFIG_SERVER['timeout'])))
                         if not url:
                             base = node_info.get('public_url_base')
                             include_bucket = bool(node_info.get('bucket_in_path', True))
+                            from urllib.parse import quote as _q
+                            rk_enc = _q(real_key, safe='/ ')
                             if include_bucket:
-                                url = f"{base.rstrip('/')}/{bucket}/{real_key}"
+                                url = f"{base.rstrip('/')}/{bucket}/{rk_enc}"
                             else:
-                                url = f"{base.rstrip('/')}/{real_key}"
+                                url = f"{base.rstrip('/')}/{rk_enc}"
                         # 选择模式
                         if local_size > 0 and file_size and local_size < file_size:
                             # 顺序续传回退
@@ -1471,7 +1726,20 @@ class ModUtils:
                             except Exception:
                                 http_bps = 0
                             conc, part_sz = ModUtils._choose_parallel_params(http_bps, ModUtils.get_minio_settings() or {}, mode='http')
-                            ModUtils._http_parallel_download(url, temp_file, int(file_size or 0), pause_event, progress_callback, mod_id, part_size=part_sz, concurrency=conc)
+                            ModUtils._http_parallel_download(
+                                url,
+                                temp_file,
+                                int(file_size or 0),
+                                pause_event,
+                                progress_callback,
+                                mod_id,
+                                part_size=part_sz,
+                                concurrency=conc,
+                                cancel_event=cancel_evt_local,
+                            )
+                            # 若在下载过程中被回调标记为取消，则终止后续流程
+                            if cancel_evt_local.is_set():
+                                raise Exception("同步被用户取消")
                 finally:
                     try:
                         if progress_thread is not None:
@@ -1533,7 +1801,7 @@ class ModUtils:
         return False
 
     @staticmethod
-    def _http_parallel_download(url: str, temp_file: str, file_size: int, pause_event: Optional[threading.Event], progress_callback: Optional[Callable], mod_id: Optional[str], part_size: Optional[int] = None, concurrency: Optional[int] = None):
+    def _http_parallel_download(url: str, temp_file: str, file_size: int, pause_event: Optional[threading.Event], progress_callback: Optional[Callable], mod_id: Optional[str], part_size: Optional[int] = None, concurrency: Optional[int] = None, cancel_event: Optional[threading.Event] = None):
         import math
         import requests as _rq
         from requests.adapters import HTTPAdapter
@@ -1581,9 +1849,12 @@ class ModUtils:
                 p = (progress['done'] / progress['total'] * 100.0) if progress['total'] > 0 else 0.0
                 if progress_callback:
                     try:
-                        progress_callback(mod_id, p, speed, 0, progress['done'], progress['total'], 'download')
+                        cont = progress_callback(mod_id, p, speed, 0, progress['done'], progress['total'], 'download')
+                        if cont is False and cancel_event is not None:
+                            cancel_event.set()
                     except Exception:
-                        pass
+                        if cancel_event is not None:
+                            cancel_event.set()
 
         # 建立任务队列
         ranges = []
@@ -1605,6 +1876,8 @@ class ModUtils:
                 if pause_event is not None and not pause_event.is_set():
                     while pause_event is not None and not pause_event.is_set():
                         time.sleep(0.1)
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 try:
                     start, end = tasks.get_nowait()
                 except Exception:
@@ -1618,6 +1891,8 @@ class ModUtils:
                     with open(temp_file, 'r+b') as f:
                         f.seek(start)
                         for chunk in resp.iter_content(chunk_size=512*1024):
+                            if cancel_event is not None and cancel_event.is_set():
+                                break
                             if not chunk:
                                 continue
                             ModUtils._limit_speed(len(chunk))
@@ -1788,9 +2063,9 @@ class ModUtils:
                 except Exception:
                     client = None
 
-            # 一次性列举：构建 key -> size 列表缓存
-            obj_prefix = str(settings.get('object_prefix', 'uploads/1/mods')).strip('/')
-            list_prefix = obj_prefix + '/' if obj_prefix else ''
+            # 一次性列举：构建 key -> size 列表缓存（根目录，无前缀）
+            obj_prefix = ''
+            list_prefix = ''
             objects_index: List[Tuple[str, int, float]] = []
             cache_key = (bucket, list_prefix)
             # 磁盘缓存优先
@@ -1844,12 +2119,13 @@ class ModUtils:
                     objects_index = ModUtils._r2_index_cache[cache_key]
                 else:
                     objects_index = _load_objects_cache()
-                    if objects_index:
+                    if objects_index and len(mod_ids) > 8:
                         ModUtils._r2_index_cache[cache_key] = objects_index
 
-            if client and bucket and not objects_index:
+            if client and bucket and not objects_index and mod_ids:
                 try:
                     paginator = client.get_paginator('list_objects_v2')
+                    # 仅在需要时列举；对于少量目标，也可以直接走逐项探测
                     for page in paginator.paginate(Bucket=bucket, Prefix=list_prefix):
                         for obj in page.get('Contents', []) or []:
                             k = str(obj.get('Key', ''))
@@ -1877,8 +2153,7 @@ class ModUtils:
                     filename = info.get('filename', f"{info.get('name','mod')}_{mid}.7z")
                     name = info.get('name', '')
                     version = info.get('version', '')
-                    obj_prefix = str(settings.get('object_prefix', 'uploads/1/mods')).strip('/')
-                    key_template = str(settings.get('object_key_template', '')).strip()
+                    # 根目录策略：不使用任何模板
 
                     # 候选键
                     candidates: List[str] = []
@@ -1888,23 +2163,15 @@ class ModUtils:
                     raw_path = str(info.get('path') or '').strip()
                     if raw_path:
                         candidates.append(raw_path.lstrip('/'))
-                    if key_template:
-                        try:
-                            rendered = key_template.format(
-                                object_prefix=obj_prefix,
-                                mod_id=mid,
-                                filename=filename,
-                                name=name,
-                                version=version,
-                            ).strip('/').replace('\\', '/')
-                            if rendered:
-                                candidates.append(rendered)
-                        except Exception:
-                            pass
-                    norm_filename = str(filename).lstrip('/').replace('\\', '/')
-                    if obj_prefix:
-                        candidates.append(f"{obj_prefix}/{norm_filename}")
-                    candidates.append(norm_filename)
+                    # 不使用模板；仅使用显式 path 与标准文件名
+                    # 规则拼接的标准名（Name_ModID_Version.7z）
+                    safe_name = ModUtils.normalize_name_for_filename(name or f'mod_{mid}')
+                    norm_by_rule = f"{safe_name}_{mid}_{version}.7z".lstrip('/').replace('\\', '/')
+                    candidates.append(norm_by_rule)
+                    # 标准文件名（来自 mod_info）
+                    norm_filename_plain = str(filename).lstrip('/').replace('\\', '/')
+                    if norm_filename_plain not in candidates:
+                        candidates.append(norm_filename_plain)
 
                     # 去重
                     seen = set(); ordered = []
@@ -1918,9 +2185,9 @@ class ModUtils:
                     if objects_index:
                         # 构造后缀集合：完整文件名、_mod_id.7z、filename
                         suffixes = []
-                        suffixes.append('/' + norm_filename)
+                        suffixes.append('/' + norm_by_rule)
                         suffixes.append('_' + mid + '.7z')
-                        suffixes.append(norm_filename)
+                        suffixes.append(norm_by_rule)
                         # 选取同后缀的最新对象（按LastModified），若无时间则按Size降序
                         candidates_matches: List[Tuple[str, int, float]] = []
                         for key, sz, mt in objects_index:
@@ -1939,43 +2206,42 @@ class ModUtils:
 
                     # 若未匹配上，回退到逐项探测
                     if not matched:
-                        if http_mode and node_info:
-                            base = node_info.get('public_url_base')
-                            include_bucket = bool(node_info.get('bucket_in_path', True))
-                            for key in ordered:
-                                try:
-                                    url = f"{base.rstrip('/')}/{bucket}/{key}" if include_bucket else f"{base.rstrip('/')}/{key}"
-                                    resp = requests.head(url, timeout=max(2, ModUtils.CONFIG_SERVER['timeout']), headers=ModUtils.build_headers('*/*'), allow_redirects=True)
-                                    if resp.status_code < 400 and resp.headers.get('Content-Length'):
-                                        sizes[mid] = int(resp.headers['Content-Length'])
-                                        with ModUtils._index_lock:
-                                            ModUtils._resolved_keys[mid] = key
-                                        matched = True
-                                        break
-                                except Exception:
-                                    continue
-                        else:
-                            if client:
-                                best: Tuple[Optional[str], int, float] = (None, 0, 0.0)
-                                for key in ordered:
-                                    try:
-                                        st = client.head_object(Bucket=bucket, Key=key)
-                                        sz = int(st.get('ContentLength', 0) or 0)
-                                        lm = st.get('LastModified')
-                                        try:
-                                            mt = float(lm.timestamp()) if lm is not None else 0.0
-                                        except Exception:
-                                            mt = 0.0
-                                        # 选择最新（mt）其次更大（sz）
-                                        if mt > best[2] or (mt == best[2] and sz > best[1]):
-                                            best = (key, sz, mt)
-                                    except Exception:
-                                        continue
-                                if best[0]:
-                                    sizes[mid] = int(best[1])
+                        # 并行 HEAD 探测前若干候选，优先返回首个成功项
+                        from concurrent.futures import ThreadPoolExecutor, as_completed
+                        def _head_s3(k: str):
+                            try:
+                                st = client.head_object(Bucket=bucket, Key=k)
+                                return k, int(st.get('ContentLength', 0) or 0)
+                            except Exception:
+                                return None
+                        def _head_http(k: str):
+                            try:
+                                base = node_info.get('public_url_base')
+                                if not base:
+                                    return None
+                                headers = ModUtils.build_headers('*/*')
+                                from urllib.parse import quote as _q
+                                kenc = _q(k, safe='/ ')
+                                urls = [f"{base.rstrip('/')}/{bucket}/{kenc}", f"{base.rstrip('/')}/{kenc}"]
+                                for u in urls:
+                                    r = requests.head(u, timeout=max(2, ModUtils.CONFIG_SERVER['timeout']), headers=headers, allow_redirects=True)
+                                    if r.status_code < 400 and r.headers.get('Content-Length'):
+                                        return k, int(r.headers['Content-Length'])
+                            except Exception:
+                                return None
+                        head_fn = _head_http if (http_mode and node_info) else _head_s3
+                        ordered_limited = ordered[:4]
+                        with ThreadPoolExecutor(max_workers=min(8, len(ordered_limited))) as ex:
+                            futs = [ex.submit(head_fn, k) for k in ordered_limited]
+                            for fu in as_completed(futs):
+                                res = fu.result()
+                                if res:
+                                    k, sz = res
+                                    sizes[mid] = int(sz)
                                     with ModUtils._index_lock:
-                                        ModUtils._resolved_keys[mid] = best[0]
+                                        ModUtils._resolved_keys[mid] = k
                                     matched = True
+                                    break
                 except Exception:
                     continue
         except Exception:
@@ -2049,7 +2315,8 @@ class ModUtils:
         """并行处理：每个模组下载完成后立即解压，避免等待全部下载完成导致的延迟或取消时未解压。"""
         tasks: List[Tuple[str, str, str]] = []  # (mod_id, mod_name, mod_path)
         for mod_id in to_update:
-            mod_name = local_mods[mod_id]['name']
+            # 优先使用远端名称，确保解压后的目录为 Name_ModID
+            mod_name = (remote_mods.get(mod_id, {}) or {}).get('name') or local_mods[mod_id]['name']
             mod_path = ModUtils.build_target_mod_path(local_path, mod_name, mod_id)
             tasks.append((mod_id, mod_name, mod_path))
         for mod_id in to_add:
