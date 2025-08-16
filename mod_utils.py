@@ -97,7 +97,7 @@ class ModUtils:
     _config_cache_time = {}
     # R2 索引与解析缓存
     # 统一缓存：解析后的键与一次性列举缓存
-    _r2_index_cache: Dict[Tuple[str, str], List[Tuple[str, int]]] = {}
+    _r2_index_cache: Dict[Tuple[str, str], List[Tuple[str, int, float]]] = {}
     _resolved_keys: Dict[str, str] = {}
     _r2_index_data: Optional[dict] = None
     _r2_index_time: float = 0.0
@@ -1791,10 +1791,10 @@ class ModUtils:
             # 一次性列举：构建 key -> size 列表缓存
             obj_prefix = str(settings.get('object_prefix', 'uploads/1/mods')).strip('/')
             list_prefix = obj_prefix + '/' if obj_prefix else ''
-            objects_index: List[Tuple[str, int]] = []
+            objects_index: List[Tuple[str, int, float]] = []
             cache_key = (bucket, list_prefix)
             # 磁盘缓存优先
-            def _load_objects_cache() -> List[Tuple[str, int]]:
+            def _load_objects_cache() -> List[Tuple[str, int, float]]:
                 try:
                     if not os.path.exists(ModUtils.OBJECTS_LIST_CACHE_FILE):
                         return []
@@ -1807,22 +1807,23 @@ class ModUtils:
                     if time.time() - ts > ModUtils.OBJECTS_LIST_CACHE_TTL_SEC:
                         return []
                     entries = rec.get('entries') or []
-                    out: List[Tuple[str, int]] = []
+                    out: List[Tuple[str, int, float]] = []
                     for it in entries:
                         k = str(it.get('key', ''))
                         if not k:
                             continue
                         s = int(it.get('size', 0) or 0)
-                        out.append((k, s))
+                        mt = float(it.get('mtime', 0.0) or 0.0)
+                        out.append((k, s, mt))
                     return out
                 except Exception:
                     return []
 
-            def _save_objects_cache(objs: List[Tuple[str, int]]):
+            def _save_objects_cache(objs: List[Tuple[str, int, float]]):
                 try:
                     record = {
                         'time': time.time(),
-                        'entries': [{'key': k, 'size': s} for (k, s) in objs]
+                        'entries': [{'key': k, 'size': s, 'mtime': mt} for (k, s, mt) in objs]
                     }
                     data = {}
                     if os.path.exists(ModUtils.OBJECTS_LIST_CACHE_FILE):
@@ -1855,7 +1856,12 @@ class ModUtils:
                             if not k:
                                 continue
                             s = int(obj.get('Size', 0) or 0)
-                            objects_index.append((k, s))
+                            lm = obj.get('LastModified')
+                            try:
+                                mt = float(lm.timestamp()) if lm is not None else 0.0
+                            except Exception:
+                                mt = 0.0
+                            objects_index.append((k, s, mt))
                     with ModUtils._index_lock:
                         ModUtils._r2_index_cache[cache_key] = objects_index
                     _save_objects_cache(objects_index)
@@ -1915,16 +1921,21 @@ class ModUtils:
                         suffixes.append('/' + norm_filename)
                         suffixes.append('_' + mid + '.7z')
                         suffixes.append(norm_filename)
-                        for key, sz in objects_index:
+                        # 选取同后缀的最新对象（按LastModified），若无时间则按Size降序
+                        candidates_matches: List[Tuple[str, int, float]] = []
+                        for key, sz, mt in objects_index:
                             for suf in suffixes:
                                 if key.endswith(suf):
-                                    sizes[mid] = int(sz)
-                                    with ModUtils._index_lock:
-                                        ModUtils._resolved_keys[mid] = key
-                                    matched = True
+                                    candidates_matches.append((key, int(sz), float(mt or 0.0)))
                                     break
-                            if matched:
-                                break
+                        if candidates_matches:
+                            # 先按 mtime，再按 size 选择
+                            candidates_matches.sort(key=lambda t: (t[2], t[1]))
+                            key, sz, _mt = candidates_matches[-1]
+                            sizes[mid] = int(sz)
+                            with ModUtils._index_lock:
+                                ModUtils._resolved_keys[mid] = key
+                            matched = True
 
                     # 若未匹配上，回退到逐项探测
                     if not matched:
@@ -1945,16 +1956,26 @@ class ModUtils:
                                     continue
                         else:
                             if client:
+                                best: Tuple[Optional[str], int, float] = (None, 0, 0.0)
                                 for key in ordered:
                                     try:
                                         st = client.head_object(Bucket=bucket, Key=key)
-                                        sizes[mid] = int(st.get('ContentLength', 0) or 0)
-                                        with ModUtils._index_lock:
-                                            ModUtils._resolved_keys[mid] = key
-                                        matched = True
-                                        break
+                                        sz = int(st.get('ContentLength', 0) or 0)
+                                        lm = st.get('LastModified')
+                                        try:
+                                            mt = float(lm.timestamp()) if lm is not None else 0.0
+                                        except Exception:
+                                            mt = 0.0
+                                        # 选择最新（mt）其次更大（sz）
+                                        if mt > best[2] or (mt == best[2] and sz > best[1]):
+                                            best = (key, sz, mt)
                                     except Exception:
                                         continue
+                                if best[0]:
+                                    sizes[mid] = int(best[1])
+                                    with ModUtils._index_lock:
+                                        ModUtils._resolved_keys[mid] = best[0]
+                                    matched = True
                 except Exception:
                     continue
         except Exception:
