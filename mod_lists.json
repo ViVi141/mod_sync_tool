@@ -1,0 +1,13 @@
+{
+  "default": {
+    "name": "默认模组列表",
+    "file": "mod_info.json",
+    "description": "示例：Arma Reforger 俱乐部常用模组列表"
+  },
+  "lightweight": {
+    "name": "轻量化列表",
+    "file": "mod_info_light.json",
+    "description": "示例：只包含核心必要模组"
+  }
+}
+

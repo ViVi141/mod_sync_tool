@@ -56,7 +56,7 @@ class ModUtils:
     logger = logger
     # 配置服务器
     CONFIG_SERVER = {
-        'base_url': 'https://www.vivi141.com/upload',
+        'base_url': 'https://www.example.com/upload',
         'endpoints': {
             'mod_lists': '/mod_lists.json',
             'minio_config': '/minio_config.json',

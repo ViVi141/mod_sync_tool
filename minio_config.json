@@ -1,0 +1,29 @@
+{
+  "settings": {
+    "bucket": "arma-reforger-mods",
+    "timeout": 30,
+    "retry_count": 3,
+    "retry_delay": 1,
+    "max_workers": 4,
+    "force_r2_only": false
+  },
+  "R2_S3": {
+    "endpoint": "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.r2.cloudflarestorage.com",
+    "port": 443,
+    "access_key": "R2_ACCESS_KEY",
+    "secret_key": "R2_SECRET_KEY",
+    "secure": true,
+    "region": "auto",
+    "public_url_base": "https://mods.example.com"
+  },
+  "Local_MinIO": {
+    "endpoint": "http://127.0.0.1",
+    "port": 9000,
+    "access_key": "minioadmin",
+    "secret_key": "minioadmin",
+    "secure": false,
+    "region": "us-east-1",
+    "public_url_base": "http://127.0.0.1:9000"
+  }
+}
+

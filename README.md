@@ -1,325 +1,111 @@
-# TASK军事模拟俱乐部武装突袭重铸者模组同步器
+# mod_sync_tool
 
 当前版本：3.1.0（2025-08-16）
 
-## 功能特点
+面向 Arma Reforger 的开源模组同步/分发工具，支持多节点（Cloudflare R2/S3 兼容与 HTTP 直链）、分片并发下载、断点续传与速度限制，自动比较本地与云端版本并一键同步。提供现代化 Tkinter 界面与日志面板，适合俱乐部、服务器与个人使用。
 
-- 自动检测模组更新
-- 支持多节点下载
-- 智能负载均衡
-- 断点续传
-- 下载速度限制（0-1000Mbps）
-- 自动备份和恢复
-- 实时进度显示
-- 详细的日志记录
+## 特性
 
-## 使用说明
+- 自动检测模组更新：语义化版本比较，差异直观
+- 多节点下载：S3 优先，404 时回退 HTTP；可配置公共直链域名
+- 分片并发与断点续传：瞬时速度计算，MiB/s 与 Mbps 同显
+- 速度限制：0–1000 Mbps，运行中可随时调整
+- UI 线程安全：所有 UI 更新通过 `root.after()` 调度
+- 自动识别本地路径：解析 Arma Reforger 日志定位 addons 目录
+- 现代 UI：`ttkbootstrap` 主题、可拖拽分割、斑马纹表格与右键菜单
+- 应用内更新：读取远端 `version.json` 提示（支持强制更新）
 
-### 基本操作
-1. 选择模组列表
-2. 设置本地模组路径
-3. 选择下载节点（可选）
-4. 设置下载速度限制（可选）
-5. 点击"检查模组"查看更新状态
-6. 点击"同步模组"开始更新
+## 设计约定
 
-### 下载速度限制
-- 使用滑动条或输入框设置下载速度
-- 范围：0-1000Mbps
-- 0表示不限制下载速度
-- 建议根据网络情况设置合适的速度
-- 可以随时调整下载速度
+- 云端对象命名：`Name_ModID_Version.7z`（允许空格），全部置于存储桶根目录
+- 本地目录命名：解压至 `Name_ModID`
+- 直链支持：`mod_info*.json` 的 `path` 字段可写 `@https://...` 完整直链
 
-### 节点选择
-- 支持自动选择最佳节点
-- 可以手动选择特定节点
-- 显示节点延迟和状态
-- 支持节点状态实时更新
+## 快速开始
 
-### 注意事项
-- 首次运行会自动检查更新
-- 建议定期检查更新
-- 请确保有足够的磁盘空间
-- 请确保网络连接稳定
-- 下载大文件时建议适当限制速度
+```bash
+git clone https://github.com/yourname/mod_sync_tool.git
+cd mod_sync_tool
+pip install -r requirements.txt
+python main.py
+```
 
-## 系统要求
-- Windows 10/11
-- Python 3.8或更高版本
-- 网络连接
-- 足够的磁盘空间
+打包为单文件可执行：
 
-## 常见问题
-1. 无法访问模组目录
-   - 以管理员身份运行程序
-   - 检查目录权限设置
-   - 选择其他目录
+```bash
+pyinstaller -F -w --version-file file_version_info.txt -i favicon.ico --name "mod_sync_tool" main.py
+```
 
-2. 下载速度过慢
-   - 检查网络连接
-   - 尝试其他下载节点
-   - 调整下载速度限制
+## 配置
 
-3. 更新失败
-   - 检查网络连接
-   - 确保有足够的磁盘空间
-   - 查看日志了解详细错误信息
+项目根目录示例文件（可直接复制修改）：
 
-## 开发者指南
-
-### 1. 环境准备
-- Python 3.8 或更高版本
-- 必要的 Python 包：
-  ```bash
-  pip install boto3 py7zr requests semver
-  ```
-
-### 2. 配置文件结构
-#### 2.1 配置服务器文件
-在 `https://example/upload` 下需要准备以下文件：
-
-1. `mod_lists.json` - 模组列表配置
+1) `mod_lists.json`（选择要加载的列表文件）
 ```json
 {
-    "default": {
-        "name": "默认模组列表",
-        "file": "mod_info.json",
-        "description": "默认的模组列表"
-    }
+  "default": { "name": "默认模组列表", "file": "mod_info.json", "description": "示例" },
+  "lightweight": { "name": "轻量化列表", "file": "mod_info_light.json", "description": "示例" }
 }
 ```
 
-2. `mod_info.json` - 模组信息文件
+2) `mod_info.json`（模组清单，关键三元一致：name/mod_id/version）
 ```json
 {
-    "mod_id": {
-        "name": "模组名称",
-        "version": "版本号"
-    }
-}
-```
-
-3. `minio_config.json` - MinIO 配置（示例）
-```json
-{
-  "settings": {
-    "bucket": "你的存储桶名称",
-    "timeout": 30,
-    "retry_count": 3,
-    "retry_delay": 1,
-    "max_workers": 4
-  },
-  "MinIO节点一": {
-    "endpoint": "你的节点地址",
-    "port": 9000,
-    "access_key": "访问密钥",
-    "secret_key": "密钥",
-    "secure": false,
-    "region": "auto"
-  },
-  "MinIO节点二": {
-    "endpoint": "你的节点地址",
-    "port": 9000,
-    "access_key": "访问密钥",
-    "secret_key": "密钥",
-    "secure": false,
-    "region": "auto"
+  "62D15D0025AE021B": {
+    "name": "ZSU-23-4 Shilka",
+    "version": "1.1.5",
+    "filename": "ZSU-23-4 Shilka_62D15D0025AE021B_1.1.5.7z"
   }
 }
 ```
 
-4. `version.json` - 版本信息
+3) `minio_config.json`（R2/S3 节点与全局参数）
 ```json
 {
-    "version": "2.1.2",
-    "min_version": "2.1.2",
-    "download_url": "下载地址",
-    "changelog": "更新说明"
+  "settings": { "bucket": "arma-reforger-mods", "timeout": 30, "retry_count": 3, "retry_delay": 1, "max_workers": 4, "force_r2_only": false },
+  "R2_S3": { "endpoint": "https://your.r2.domain", "port": 443, "access_key": "AK", "secret_key": "SK", "secure": true, "region": "auto", "public_url_base": "https://cdn.example.com" }
 }
 ```
 
-### 3. 代码修改
-#### 3.1 修改配置服务器地址
-在 `mod_utils.py` 中修改 `CONFIG_SERVER` 配置：
-```python
-CONFIG_SERVER = {
-    'base_url': '你的配置服务器地址',
-    'endpoints': {
-        'mod_lists': '/mod_lists.json',
-        'minio_config': '/minio_config.json',
-        'version': '/version.json'
-    },
-    'timeout': 10,
-    'retry_count': 3,
-    'retry_delay': 1,
-    'cache_time': 300
-}
+4) `version.json`（更新检查）
+```json
+{ "latest": "3.1.0", "min": "3.1.0", "mandatory": true, "url": "https://your-domain/downloads/mod_sync_tool_v3.1.0.exe" }
 ```
 
-#### 3.2 修改版本信息
-```python
-VERSION = "你的版本号"
-MIN_VERSION = "最低支持版本"
-VERSION_CHECK_URL = "你的版本检查URL"
-```
+## 使用流程
 
-### 4. 部署步骤
-1. 准备配置服务器
-   - 确保所有配置文件都可以通过 HTTP 访问
-   - 建议使用 CDN 加速配置文件访问
+1. 启动程序（首次会自动检查更新）
+2. 选择模组列表（或在 `mod_lists.json` 指向自定义清单）
+3. 设置本地模组路径（支持自动识别）
+4. 点“检查模组”获取差异
+5. 点“同步模组”下载、校验、解压并清理临时文件
 
-2. 准备 MinIO 服务器
-   - 创建存储桶
-   - 配置访问密钥
-   - 确保节点可访问
+## 常见问题
 
-3. 上传模组文件
-   - 将模组打包为 7z 格式
-   - 上传到 MinIO 存储桶
-   - 确保文件名与 `mod_info.json` 中的配置一致
+- 速度与任务管理器不一致：UI 显示“瞬时速率”，并同时显示 MiB/s 与 Mbps 便于对齐
+- S3 404：程序会自动尝试 HTTP 直链（同时支持 `base/bucket/key` 与 `base/key` 两种 URL 形式）
+- 文件名含空格：已做 URL 编码处理；确保云端文件名严格符合命名规范
 
-### 5. 测试流程
-1. 测试配置服务器访问
-```python
-mod_lists = ModUtils.get_mod_lists()
-print(mod_lists)
-```
+## 参与贡献
 
-2. 测试 MinIO 连接
-```python
-client = ModUtils.get_minio_client('weifang')
-print(client.list_buckets())
-```
+- 提交 Issue/PR 前请先搜索是否已有讨论
+- 代码风格：保持清晰命名与类型注解，避免深层嵌套；遵循现有格式
+- 提交信息建议：`feat: ...` `fix: ...` `perf: ...` `docs: ...` `refactor: ...`
 
-3. 测试模组下载
-```python
-ModUtils.download_mod('mod_id', '目标路径')
-```
+## 许可证
 
-### 6. 注意事项
-1. 安全性
-   - 确保 MinIO 配置文件的访问权限
-   - 使用 HTTPS 保护配置服务器
-   - 定期更新访问密钥
+本项目建议采用 MIT License（你也可以在派生时改为 Apache-2.0 等）。如发布正式版，请在仓库根目录添加 `LICENSE` 文件。
 
-2. 性能优化
-   - 合理设置缓存时间
-   - 配置适当的超时时间
-   - 根据服务器性能调整并发数
+## 致谢
 
-3. 错误处理
-   - 实现完善的日志记录
-   - 添加错误重试机制
-   - 做好异常处理
+- Cloudflare R2、boto3、py7zr、ttkbootstrap 等优秀开源项目
+- 社区与俱乐部用户的持续反馈
 
-### 7. 维护建议
-1. 定期检查
-   - 监控服务器状态
-   - 检查日志文件
-   - 更新配置文件
-
-2. 版本更新
-   - 遵循语义化版本
-   - 保持向后兼容
-   - 及时更新文档
-
-3. 性能监控
-   - 记录响应时间
-   - 统计下载速度
-   - 分析错误率
-
-## 更新日志
+## 更新日志（摘）
 
 ### [3.1.0] - 2025-08-16
 
-#### 核心变更
-- 统一对象存储为“存储桶根目录”策略；移除 `object_prefix` 与旧命名回退。
-- 标准化云端文件名：`Name_ModID_Version.7z`（支持空格）。
-- 自动解析对象键：HTTP/S3 双通道探测，S3 404 时回退 HTTP。
-
-#### 性能与体验
-- “检查模组”提速：只为“需更新/需下载”的模组预取云端大小；本地 600 + 云端 200 规模显著加快。
-- 本地扫描并发化，目录大小后台补齐。
-- UI 全面线程安全，进度/速度与 ETA 更准确（MiB/s 与 Mbps）。
-
-#### 功能
-- 支持从 Arma Reforger 日志自动识别本地模组目录。
-- 新增应用启动时的软件更新检查（读取 `version.json`）。
-- 暂停/继续与取消行为更稳健。
-
-#### 其他
-- 右键菜单修复与 UI 细节优化；集成 `ttkbootstrap` 主题。
-
-### [3.0.0] - 2025-08-10
-
-#### 核心变更
-- 切换至 Cloudflare R2 官方 SDK（boto3，S3 兼容），移除 MinIO 依赖；保留现有 `minio_config.json` 文件名作为 R2 节点与全局参数配置入口。
-- R2 对象键解析优化：支持一次性列举前缀+后缀匹配、`path`/`object_key_template` 多方案，无需额外索引文件。
-- 下载→解压流水线：单个模组下载完成后立即进行完整性校验、解压并删除 7z 文件。
-
-#### 可靠性与可观测性
-- 精准速度与 ETA：采用增量字节/时间的瞬时速率；总速度仅聚合活跃任务，避免已完成任务干扰。
-- 暂停/继续 与 取消：下载循环尊重暂停；取消与窗口关闭将安全停止并清理临时文件。
-- 权限与空间预检：下载/解压前分别校验目标目录写入/删除权限；基于预取大小与磁盘剩余空间做下载前校验并给出提示。
-- 错误分级：将异常归类为“网络超时/连接错误/对象不存在/权限不足/限流/服务端错误/空间不足/校验失败”等，便于定位问题。
-- 日志系统：日志默认写入 `%USERPROFILE%/Documents/mod_sync_tool/`，按天轮转保留 7 天。
-
-#### 性能与体验
-- 速度限制上限提升至 0–1000 Mbps；可随时调整。
-- 吞吐优化：HTTP keep-alive、较大分块（S3/HTTP）与线程数自适应，提升大文件与“最后一个文件”下载性能。
-- 列表与交互：状态高亮（成功“已同步”绿色、失败红色）；右键菜单新增“打开选中模组目录/打开日志目录”。
-
-#### 修复
-- 统一“成功”触发解压逻辑，修复“下载成功但不解压”的问题。
-- 解决提前发送 100% 完成导致的误完成问题；完成信号改为解压成功后发送。
-- 改进 7z 校验为“头部+目录解析”，避免大文件二次全面 test 卡顿。
-
-### 版本 2.1.0 (2025-05-14)
-
-#### 新增功能
-- 添加自动版本检查功能
-- 添加版本更新提示
-- 添加更新说明显示
-- 添加版本比较功能
-
-#### 安全性改进
-- 移除敏感信息日志记录
-- 改进文件权限检查机制
-- 增强错误处理安全性
-- 添加文件完整性验证
-
-#### 功能优化
-- 简化下载流程
-- 改进模组比较逻辑
-- 优化同步机制
-- 改进配置管理
-
-#### 用户界面更新
-- 更新窗口标题至 V2.1.0
-- 优化模组列表排序功能
-- 改进状态显示
-- 优化进度提示
-
-### [2.1.1] - 2025-05-14
-
-#### 新增功能
-- 添加下载速度限制功能
-  - 支持0-200Mbps的速度限制
-  - 提供滑动条和数值输入两种控制方式
-  - 实时显示当前下载速度
-  - 自动计算剩余下载时间
-
-#### 功能优化
-- 优化下载速度控制逻辑
-  - 使用滑动窗口算法实现精确限速
-  - 支持动态调整下载速度
-  - 优化限速对系统资源的影响
-
-### [2.1.2] - 2024-05-16
-- 优化 mod_info.json 获取逻辑，优先从配置服务器获取，只有失败时才从 MinIO 获取。
-- 清理无用文件，优化项目结构。
-
-## 技术支持
-- 作者：ViVi141
-- QQ：747384120
-- 版本：3.1.0
+- 统一根目录对象命名与解析：`Name_ModID_Version.7z`，支持空格与 URL 编码
+- “检查模组”提速：只为需更新/未安装条目预取云端大小；并行 HEAD 探测
+- S3→HTTP 回退：S3 404 时自动尝试直链；速度显示更贴近系统监控
+- UI 与稳定性：全面主线程更新调度；现代主题与右键菜单；暂停/取消更即时
