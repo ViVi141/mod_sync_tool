@@ -94,7 +94,7 @@ pyinstaller -F -w --version-file file_version_info.txt -i favicon.ico --name "mo
 
 ## 许可证
 
-本项目建议采用 MIT License（你也可以在派生时改为 Apache-2.0 等）。如发布正式版，请在仓库根目录添加 `LICENSE` 文件。
+ AGPL-3.0 license
 
 ## 致谢
 
